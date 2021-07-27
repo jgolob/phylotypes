@@ -106,7 +106,7 @@ class Jplace():
             len(sv_groups),
             max([len(svg) for svg in sv_groups])
         ))
-        logging.info("Obtaining lowest common acestor for each group")
+        logging.info("Obtaining lowest common ancestor for each group")
         sv_group_lca = [
             self.tree.lowest_common_ancestor([self.name_node[nid] for sv in gsv for nid in self.sv_nodes[sv]])
             for gsv in sv_groups
@@ -302,7 +302,9 @@ def main():
     args = args_parser.parse_args()
     jplace = Jplace(args.jplace)
     jplace.group_features(args.lwr_overlap, args.threshold_pd)
+    logging.info("Done Phylogrouping. Outputting.")
     jplace.to_csv(args.out)
+    logging.info("DONE!")
 
 
 if __name__ == "__main__":
