@@ -31,7 +31,7 @@ setuptools.setup(
     ],
     entry_points={
         'console_scripts': [
-            'phylotypes=phylotypes:main',
+            'phylotypes=phylotypes.phylotypes:main',
         ],
     },
 )
