@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO)
 class Jplace():
     jplace = None
     phylogroups = []
-    lwr_overlap = 0.95
-    pd_threshold = 0.1
+    lwr_overlap = 0.1
+    pd_threshold = 1.0
 
     def __init__(self, jplace_fh):
         logging.info("Loading jplace file")
@@ -289,13 +289,13 @@ def main():
     )
     args_parser.add_argument(
         '--lwr-overlap', '-L',
-        help='minimum like-weight ratio for grouping of features. (Default: 0.95).',
+        help='minimum like-weight ratio for grouping of features. (Default: 0.1).',
         default=0.95,
         type=float,
     )
     args_parser.add_argument(
         '--threshold_pd', '-T',
-        help='Phylogenetic distance threshold for clustering. (Default: 0.1)',
+        help='Phylogenetic distance threshold for clustering. (Default: 1.0)',
         default=0.1,
         type=float,
     )
