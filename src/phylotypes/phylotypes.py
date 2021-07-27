@@ -260,10 +260,10 @@ class Jplace():
             for pg_i, (pg_idx, pg_size) in enumerate(pg_size)
             for sv in self.phylogroups[pg_idx]
         ]
+        return pg_sv_long
 
-    def to_csv(self, out_h, pg_long=None):
-        if pg_long is None:
-            pg_long = self.to_long()
+    def to_csv(self, out_h):
+        pg_long = self.to_long()
         writer = csv.writer(out_h)
         writer.writerow(['phylotype', 'sv'])
         writer.writerows(pg_long)
