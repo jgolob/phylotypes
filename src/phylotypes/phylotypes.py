@@ -82,7 +82,10 @@ class Jplace():
                     self.sv_nodes[sv] = pl_nodes
 
     # Public methods
-    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1):
+    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False):
+        # no_dl if true will ignore the remaining distance to nodes.
+        if no_dl:
+            logging.info("Ignoring distal length.")
         self.lwr_overlap = lwr_overlap
         self.pd_threshold = pd_threshold
         sv_to_group = set(self.sv_nodes)
@@ -165,25 +168,45 @@ class Jplace():
             g_sv_dist_l = []
             for i in range(len(g_sv)):
                 sv1 = g_sv[i]
-                sv1_p = {
-                    nid:
-                    (
-                        npl[self.lwr_idx],
-                        npl[self.dl_idx]
-                    )
-                    for nid, npl in self.sv_nodes[sv1].items()
-                }
-                sv1_lwr_total = sum((p[0] for p in sv1_p.values()))
-                for j in range(i + 1, len(g_sv)):
-                    sv2 = g_sv[j]
-                    sv2_p = {
+                if no_dl:
+                    sv1_p = {
+                        nid:
+                        (
+                            npl[self.lwr_idx],
+                            0
+                        )
+                        for nid, npl in self.sv_nodes[sv1].items()
+                    }
+                else:
+                    sv1_p = {
                         nid:
                         (
                             npl[self.lwr_idx],
                             npl[self.dl_idx]
                         )
-                        for nid, npl in self.sv_nodes[sv2].items()
+                        for nid, npl in self.sv_nodes[sv1].items()
                     }
+                sv1_lwr_total = sum((p[0] for p in sv1_p.values()))
+                for j in range(i + 1, len(g_sv)):
+                    sv2 = g_sv[j]
+                    if no_dl:
+                        sv2_p = {
+                            nid:
+                            (
+                                npl[self.lwr_idx],
+                                0
+                            )
+                            for nid, npl in self.sv_nodes[sv2].items()
+                        }
+                    else:
+                        sv2_p = {
+                            nid:
+                            (
+                                npl[self.lwr_idx],
+                                npl[self.dl_idx]
+                            )
+                            for nid, npl in self.sv_nodes[sv2].items()
+                        }
                     sv2_lwr_total = sum((p[0] for p in sv2_p.values()))
                     # Initialize the distance as zero
                     paired_dist = 0
@@ -289,7 +312,7 @@ def main():
     )
     args_parser.add_argument(
         '--lwr-overlap', '-L',
-        help='minimum like-weight ratio for grouping of features. (Default: 0.1).',
+        help='minimum like-weight ratio for grouping of features. (Default: 0.95).',
         default=0.95,
         type=float,
     )
@@ -299,9 +322,14 @@ def main():
         default=0.1,
         type=float,
     )
+    args_parser.add_argument(
+        '--no-distal-length', '-ndl',
+        help='Ignore distal length to nodes. (Default: False)',
+        action='store_true'
+    )
     args = args_parser.parse_args()
     jplace = Jplace(args.jplace)
-    jplace.group_features(args.lwr_overlap, args.threshold_pd)
+    jplace.group_features(args.lwr_overlap, args.threshold_pd, no_dl=args.no_distal_length)
     logging.info("Done Phylogrouping. Outputting.")
     jplace.to_csv(args.out)
     logging.info("DONE!")
