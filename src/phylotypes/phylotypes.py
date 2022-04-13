@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import argparse
 import logging
-import pandas as pd
+import numpy as np
 from Bio import Phylo
 from skbio import TreeNode
 import json
@@ -9,19 +9,21 @@ from io import StringIO
 from collections import defaultdict
 from sklearn.cluster import AgglomerativeClustering
 import csv
-import sys
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 
 
 class Jplace():
-    jplace = None
-    phylogroups = []
     lwr_overlap = 0.1
     pd_threshold = 1.0
 
     def __init__(self, jplace_fh):
+        # Set up some reasonable instance defaults
+        self.jplace = None
+        self.phylogroups = []
+        self.sv_groups = []
+
         logging.info("Loading jplace file")
         self.jplace = json.load(
             jplace_fh
@@ -81,13 +83,7 @@ class Jplace():
                 for sv in pl['n']:
                     self.sv_nodes[sv] = pl_nodes
 
-    # Public methods
-    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False):
-        # no_dl if true will ignore the remaining distance to nodes.
-        if no_dl:
-            logging.info("Ignoring distal length.")
-        self.lwr_overlap = lwr_overlap
-        self.pd_threshold = pd_threshold
+    def __pregroup_by_LWR__(self, pd_threshold, lwr_overlap):
         sv_to_group = set(self.sv_nodes)
         # Reset to empty list
         sv_groups = []
@@ -114,24 +110,18 @@ class Jplace():
             self.tree.lowest_common_ancestor([self.name_node[nid] for sv in gsv for nid in self.sv_nodes[sv]])
             for gsv in sv_groups
         ]
+
         logging.info("Calculating pairwise phylogenetic distance between groups")
-        g_lca_dist = [
-            (
-                i,
-                j,
-                sv_group_lca[i].distance(sv_group_lca[j])
-            )
-            for i in range(len(sv_group_lca))
-            for j in range(i + 1, len(sv_group_lca))
-        ]
-        logging.info("Converting to distance matrix")
-        g_lca_mat = pd.concat(
-            [
-                pd.DataFrame(g_lca_dist, columns=['i', 'j', 'dist']),
-                pd.DataFrame(g_lca_dist, columns=['j', 'i', 'dist'])
-            ],
-            ignore_index=True
-        ).drop_duplicates().pivot(index='i', columns='j', values='dist').fillna(0.0)
+        g_lca_mat = np.zeros(
+            shape=(len(sv_group_lca), len(sv_group_lca)),
+            dtype=np.float64
+        )
+        for i in range(len(sv_group_lca)):
+            for j in range(i + 1, len(sv_group_lca)):
+                ij_pd = sv_group_lca[i].distance(sv_group_lca[j])
+                g_lca_mat[i, j] = ij_pd
+                g_lca_mat[j, i] = ij_pd
+
         logging.info('Clusting groups by phylogenetic distance')
         g_lca_clusters = AgglomerativeClustering(
             n_clusters=None,
@@ -139,7 +129,8 @@ class Jplace():
             affinity='precomputed',
             linkage='average'
         ).fit_predict(g_lca_mat)
-        # Regrouping based on clusters
+
+        logging.info("Regrouping SV based on group-clusters")
         new_old_sv_groups = defaultdict(set)
         for old_cluster_idx, new_cluster_idx in enumerate(g_lca_clusters):
             new_old_sv_groups[new_cluster_idx].add(old_cluster_idx)
@@ -156,16 +147,34 @@ class Jplace():
             ])
         ))
         self.sv_groups = new_sv_groups
+
+    # Public methods
+    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False):
+        # no_dl if true will ignore the remaining distance to nodes.
+        if no_dl:
+            logging.info("Ignoring distal length.")
+        self.lwr_overlap = lwr_overlap
+        self.pd_threshold = pd_threshold
+
+        logging.info("Pregrouping based on overlapping LWR for SV")
+        self.__pregroup_by_LWR__(pd_threshold, lwr_overlap)
+
         # ----
         logging.info("Starting phylogrouping")
-        for g_i, g_sv in enumerate(new_sv_groups):
+        for g_i, g_sv in enumerate(self.sv_groups):
             if (g_i + 1) % 100 == 0:
-                logging.info("Group {} of {}".format(g_i, len(new_sv_groups)))
+                logging.info("Group {} of {}".format(g_i, len(self.sv_groups)))
             if len(g_sv) == 1:
                 self.phylogroups.append(set(g_sv))
                 continue
             # If the length of the SV_group is greater than zero, cluster by pairwise PD
-            g_sv_dist_l = []
+            g_sv_dist_mat = np.zeros(
+                shape=(
+                    len(g_sv),
+                    len(g_sv)
+                ),
+                dtype=np.float64
+            )
             for i in range(len(g_sv)):
                 sv1 = g_sv[i]
                 if no_dl:
@@ -236,21 +245,9 @@ class Jplace():
                             for nid, np in sv2_p.items()
                             if nid in distant_nodes
                         ]) / sv2_lwr_total)
+                    g_sv_dist_mat[i, j] = paired_dist
+                    g_sv_dist_mat[j, i] = paired_dist
 
-                    g_sv_dist_l.append((
-                        sv1,
-                        sv2,
-                        paired_dist
-                    ))
-            # Create a distance matrix of the SVs in this group
-            g_sv_dist_mat = pd.concat([
-                pd.DataFrame(g_sv_dist_l, columns=['sv1', 'sv2', 'dist']),
-                pd.DataFrame(g_sv_dist_l, columns=['sv2', 'sv1', 'dist'])
-            ], ignore_index=True).drop_duplicates().pivot(
-                index='sv1',
-                columns='sv2',
-                values='dist'
-            ).fillna(0.0)
             # And use it for agglomerative clustering
             g_sv_clusters = AgglomerativeClustering(
                 n_clusters=None,
@@ -260,7 +257,7 @@ class Jplace():
             ).fit_predict(g_sv_dist_mat)
             # Map
             g_phylotype_svs = defaultdict(set)
-            for sv, cl in zip(g_sv_dist_mat.index, g_sv_clusters):
+            for sv, cl in zip(g_sv, g_sv_clusters):
                 g_phylotype_svs[cl].add(sv)
             # And append the groups to the phylogroups list
             self.phylogroups += [
