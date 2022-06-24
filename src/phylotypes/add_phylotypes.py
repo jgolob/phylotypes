@@ -206,7 +206,7 @@ def main():
     new_jp = Jplace(args.new_jp)
 
     new_sv_pt = {}
-    orphaned_new_sv = {}
+    orphaned_new_sv = set()
 
     for new_sv, new_sv_nodes in new_jp.sv_nodes.items():
         overlap_edges = sorted([
