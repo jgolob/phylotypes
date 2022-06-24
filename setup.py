@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="phylotypes",
-    version="0.0.1",
+    version="0.0.2",
     author="Jonathan Louis Golob",
     author_email="j-dev@golob.org",
     description="Group phylogenetically placed sequence variants into phylotypes",
@@ -26,7 +26,7 @@ setuptools.setup(
     install_requres=[
         'biopython',
         'scikit-bio',
-        'pandas',
+        'numpy',
         'sklearn',
     ],
     entry_points={
