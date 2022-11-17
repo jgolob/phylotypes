@@ -8,7 +8,9 @@ import json
 from io import StringIO
 from collections import defaultdict
 from sklearn.cluster import AgglomerativeClustering
+import pandas as pd
 import csv
+import sys
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -83,7 +85,7 @@ class Jplace():
                 for sv in pl['n']:
                     self.sv_nodes[sv] = pl_nodes
 
-    def __pregroup_by_LWR__(self, pd_threshold, lwr_overlap):
+    def __pregroup_by_LWR__(self, lwr_overlap):
         sv_to_group = [
             sv
             for sv, svp_l in 
@@ -111,6 +113,10 @@ class Jplace():
             len(sv_groups),
             max([len(svg) for svg in sv_groups])
         ))
+        self.sv_groups = sv_groups
+
+    def __cluster_pregroups__(self, pd_threshold):
+        sv_groups = self.sv_groups
         logging.info("Obtaining lowest common ancestor for each group")
         sv_group_lca = [
             self.tree.lowest_common_ancestor([self.name_node[nid] for sv in gsv for nid in self.sv_nodes[sv]])
@@ -155,7 +161,65 @@ class Jplace():
         self.sv_groups = new_sv_groups
 
     # Public methods
-    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False):
+    def group_features_lwr(self, lwr_overlap=0.8, cluster_threshold=1e-3):
+        self.lwr_overlap = lwr_overlap
+        self.cluster_threshold = cluster_threshold
+        # ---
+        logging.info("Pregrouping based on overlapping LWR for SV")
+        self.__pregroup_by_LWR__(lwr_overlap)
+        logging.info("Starting phylogrouping by LWR")
+        sv_pt = {}
+        # Now for each sv-group, cluster
+        for g_i, g_sv in enumerate(self.sv_groups):
+            # Get a wide table of the LWR
+            g_lwr_w = pd.DataFrame([
+                {
+                    'sv': sv,
+                    'edge': svp[self.edge_idx],
+                    'lwr': svp[self.lwr_idx]
+                }
+                for sv in g_sv
+                for svp in self.sv_nodes[sv].values()
+            ]).pivot(
+                index='sv',
+                columns='edge',
+                values='lwr'
+            ).fillna(0)
+            if len(g_lwr_w.columns) == 1 or len(g_lwr_w) == 1:
+                sv_pt.update({
+                    sv: f'ptg{g_i+1:04d}c{1:04d}'
+                    for sv in g_sv
+                })
+            else:
+                sv_pt.update({
+                    sv: f'ptg{g_i + 1:04d}c{cl + 1:04d}'
+                    for sv, cl in
+                    zip(
+                        g_lwr_w.index,
+                        AgglomerativeClustering(
+                            n_clusters=None,
+                            distance_threshold=cluster_threshold,
+                            affinity='euclidean',
+                            linkage='average'
+                        ).fit_predict(g_lwr_w)
+                    )
+                })
+        # Now we have our phylotypes
+        self.phylogroups = [
+            set(svs.sv)
+            for pt, svs in pd.DataFrame(
+                [
+                    {
+                        'sv': sv,
+                        'pt': pt
+                    }
+                    for (sv, pt) in
+                    sv_pt.items()
+                ]
+            ).groupby('pt')
+        ]
+
+    def group_features_pd(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False):
         # no_dl if true will ignore the remaining distance to nodes.
         if no_dl:
             logging.info("Ignoring distal length.")
@@ -163,7 +227,8 @@ class Jplace():
         self.pd_threshold = pd_threshold
 
         logging.info("Pregrouping based on overlapping LWR for SV")
-        self.__pregroup_by_LWR__(pd_threshold, lwr_overlap)
+        self.__pregroup_by_LWR__(lwr_overlap)
+        self.__cluster_pregroups__(pd_threshold)
 
         # ----
         logging.info("Starting phylogrouping")
@@ -315,14 +380,19 @@ def main():
     )
     args_parser.add_argument(
         '--lwr-overlap', '-L',
-        help='minimum like-weight ratio for grouping of features. (Default: 0.95).',
-        default=0.95,
+        help='minimum like-weight ratio for grouping of features. (Default: 0.5).',
+        default=0.5,
         type=float,
     )
     args_parser.add_argument(
+        '--cluster_threshold', '-C',
+        help='Cluster theshold for LWR-based phylotypes (suggest 0.001)',
+        type=float,
+
+    )
+    args_parser.add_argument(
         '--threshold_pd', '-T',
-        help='Phylogenetic distance threshold for clustering. (Default: 1.0)',
-        default=0.1,
+        help='Phylogenetic distance threshold for clustering. Suggest 0.1 to 1 if used.',
         type=float,
     )
     args_parser.add_argument(
@@ -332,7 +402,13 @@ def main():
     )
     args = args_parser.parse_args()
     jplace = Jplace(args.jplace)
-    jplace.group_features(args.lwr_overlap, args.threshold_pd, no_dl=args.no_distal_length)
+    if args.threshold_pd is not None:
+        jplace.group_features_pd(args.lwr_overlap, args.threshold_pd, no_dl=args.no_distal_length)
+    elif args.cluster_threshold is not None:
+        jplace.group_features_lwr(args.lwr_overlap, args.cluster_threshold)
+    else:
+        logging.error("You need to provide either a threshold_pd or cluster_threshold")
+        sys.exit(-1)
     logging.info("Done Phylogrouping. Outputting.")
     jplace.to_csv(args.out)
     logging.info("DONE!")
