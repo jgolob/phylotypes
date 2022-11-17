@@ -84,7 +84,15 @@ class Jplace():
                     self.sv_nodes[sv] = pl_nodes
 
     def __pregroup_by_LWR__(self, pd_threshold, lwr_overlap):
-        sv_to_group = set(self.sv_nodes)
+        sv_to_group = [
+            sv
+            for sv, svp_l in 
+            sorted([
+                (sv, len(svp))
+                for sv, svp in 
+                self.sv_nodes.items()
+            ], key=lambda v: v[1])
+        ]
         # Reset to empty list
         sv_groups = []
         logging.info("Grouping {} features".format(len(sv_to_group)))
@@ -97,9 +105,7 @@ class Jplace():
                 if sum([p[self.lwr_idx] for nid, p in self.sv_nodes[sv].items() if nid in group_node_ids]) >= lwr_overlap:
                     # Add to this group
                     group_svs.add(sv)
-                    # Add this SV's node IDs to the group
-                    group_node_ids.update(set(self.sv_nodes[sv]))
-            sv_to_group.difference_update(group_svs)
+            sv_to_group = [sv for sv in sv_to_group if sv not in group_svs]
             sv_groups.append(list(group_svs))
         logging.info("Done pre-grouping features into {} groups, of which the largest is {} items".format(
             len(sv_groups),
