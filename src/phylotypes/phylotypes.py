@@ -150,7 +150,7 @@ class Jplace():
             )
             sv_to_group = [sv for sv in sv_to_group if sv not in group_svs]
             sv_groups.append(list(group_svs))
-            logging.info(f'{len(sv_to_group)} SVs remain')
+            logging.info(f'{len(sv_to_group)} SVs remain to pregroup')
 
         logging.info("Done pre-grouping features into {} groups, of which the largest is {} items".format(
             len(sv_groups),
@@ -360,8 +360,8 @@ def main():
     )
     args_parser.add_argument(
         '--lwr-overlap', '-L',
-        help='minimum like-weight ratio for grouping of features. (Default: 0.95).',
-        default=0.95,
+        help='minimum like-weight ratio for grouping of features. (Default: 0.01).',
+        default=0.01,
         type=float,
     )
     args_parser.add_argument(
