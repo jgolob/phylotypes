@@ -10,7 +10,7 @@ from collections import defaultdict
 from sklearn.cluster import AgglomerativeClustering
 import pandas as pd
 import csv
-import sys
+import sys  
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 class Jplace():
     lwr_overlap = 0.1
     pd_threshold = 1.0
+    cluster_threshold = 0.5
 
     def __init__(self, jplace_fh):
         # Set up some reasonable instance defaults
@@ -161,7 +162,7 @@ class Jplace():
         self.sv_groups = new_sv_groups
 
     # Public methods
-    def group_features_lwr(self, lwr_overlap=0.8, cluster_threshold=1e-3):
+    def group_features_lwr(self, lwr_overlap=0.8, cluster_threshold=0.5):
         self.lwr_overlap = lwr_overlap
         self.cluster_threshold = cluster_threshold
         # ---
@@ -386,7 +387,7 @@ def main():
     )
     args_parser.add_argument(
         '--cluster_threshold', '-C',
-        help='Cluster theshold for LWR-based phylotypes (suggest 0.001)',
+        help='Cluster theshold for LWR-based phylotypes (suggest 0.5)',
         type=float,
 
     )
