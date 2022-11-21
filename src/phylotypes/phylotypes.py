@@ -9,9 +9,26 @@ from io import StringIO
 from collections import defaultdict
 from sklearn.cluster import AgglomerativeClustering
 import csv
+import taichi as ti
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+
+
+# Taichi functions
+ti.init()
+
+
+@ti.kernel
+def LWR_Filter(mat: ti.types.ndarray(), res: ti.types.ndarray(), threshold: float):
+    for i in range(mat.shape[0]):
+        rsum = 0.0
+        for j in range(mat.shape[1]):
+            rsum += mat[i, j]
+        if rsum >= threshold:
+            res[i] = 1
+        else:
+            res[i] = 0
 
 
 class Jplace():
@@ -20,9 +37,10 @@ class Jplace():
 
     def __init__(self, jplace_fh):
         # Set up some reasonable instance defaults
-        self.jplace = None
+
         self.phylogroups = []
         self.sv_groups = []
+        self.jplace = {}
 
         logging.info("Loading jplace file")
         self.jplace = json.load(
@@ -86,10 +104,10 @@ class Jplace():
     def __pregroup_by_LWR__(self, pd_threshold, lwr_overlap):
         sv_to_group = [
             sv
-            for sv, svp_l in 
+            for sv, svp_l in
             sorted([
                 (sv, len(svp))
-                for sv, svp in 
+                for sv, svp in
                 self.sv_nodes.items()
             ], key=lambda v: v[1])
         ]
@@ -100,13 +118,40 @@ class Jplace():
             seed_sv = sv_to_group.pop()
             group_svs = set([seed_sv])
             group_node_ids = set(self.sv_nodes[seed_sv])
-            # Loop through the remaining sv's, and add any to this group with overlapping placed nodes
-            for sv in sv_to_group:
-                if sum([p[self.lwr_idx] for nid, p in self.sv_nodes[sv].items() if nid in group_node_ids]) >= lwr_overlap:
-                    # Add to this group
-                    group_svs.add(sv)
+            # Make a matrix for this group
+            empty_mat = [0] * (self.lwr_idx + 1)
+            g_overlap_mat = np.array([
+                [
+                    self.sv_nodes[sv].get(
+                        n, empty_mat
+                    )[self.lwr_idx]
+                    for n in group_node_ids
+                ]
+                for sv in sv_to_group
+            ])
+            # Use some matrix math to find svs to add to this group
+            group_mask = np.zeros(
+                g_overlap_mat.shape[0],
+                dtype=int
+            )
+            LWR_Filter(
+                g_overlap_mat,
+                group_mask,
+                lwr_overlap
+            )
+            group_svs.update(
+                {
+                    sv
+                    for (sv, m) in
+                    zip(
+                        sv_to_group, group_mask.astype(bool)
+                    ) if m
+                }
+            )
             sv_to_group = [sv for sv in sv_to_group if sv not in group_svs]
             sv_groups.append(list(group_svs))
+            logging.info(f'{len(sv_to_group)} SVs remain')
+
         logging.info("Done pre-grouping features into {} groups, of which the largest is {} items".format(
             len(sv_groups),
             max([len(svg) for svg in sv_groups])
