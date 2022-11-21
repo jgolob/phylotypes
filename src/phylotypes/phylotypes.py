@@ -118,6 +118,11 @@ class Jplace():
             seed_sv = sv_to_group.pop()
             group_svs = set([seed_sv])
             group_node_ids = set(self.sv_nodes[seed_sv])
+            if len(sv_to_group) == 0:
+                sv_groups.append(
+                    group_svs
+                )
+                continue
             # Make a matrix for this group
             empty_mat = [0] * (self.lwr_idx + 1)
             g_overlap_mat = np.array([
@@ -150,7 +155,7 @@ class Jplace():
             )
             sv_to_group = [sv for sv in sv_to_group if sv not in group_svs]
             sv_groups.append(list(group_svs))
-            logging.info(f'{len(sv_to_group)} SVs remain to pregroup')
+            logging.info(f'{len(sv_to_group)} SVs remain to pregroup, with {len(group_node_ids)} nodes at this step')
 
         logging.info("Done pre-grouping features into {} groups, of which the largest is {} items".format(
             len(sv_groups),
