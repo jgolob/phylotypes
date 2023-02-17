@@ -10,6 +10,7 @@ from collections import defaultdict
 from sklearn.cluster import AgglomerativeClustering
 import csv
 import taichi as ti
+import multiprocessing
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
