@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="phylotypes",
-    version="0.0.6",
+    version="0.0.7",
     author="Jonathan Louis Golob",
     author_email="j-dev@golob.org",
     description="Group phylogenetically placed sequence variants into phylotypes",

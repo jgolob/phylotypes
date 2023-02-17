@@ -183,7 +183,7 @@ class Jplace():
         g_lca_clusters = AgglomerativeClustering(
             n_clusters=None,
             distance_threshold=pd_threshold,
-            affinity='precomputed',
+            metric='precomputed',
             linkage='average'
         ).fit_predict(g_lca_mat)
 
