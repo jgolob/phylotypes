@@ -309,7 +309,7 @@ class Jplace():
             g_sv_clusters = AgglomerativeClustering(
                 n_clusters=None,
                 distance_threshold=pd_threshold,
-                affinity='precomputed',
+                metric='precomputed',
                 linkage='average'
             ).fit_predict(g_sv_dist_mat)
             # Map

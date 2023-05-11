@@ -248,8 +248,11 @@ def main():
             new_sv_pt[new_sv] = nsv_pt_dist[0][0]
 
     if len(orphaned_new_sv) > 0:
-        logging.error(f"Could not add {len(orphaned_new_sv)} of the new sequence variants into the existing phylotypes.")
+        logging.error(f"Could not add {len(orphaned_new_sv)} of {len(orphaned_new_sv) + len(new_sv_pt)} sequence variants into the existing phylotypes.")
 
+    print(
+        f"Successfully integrated {len(new_sv_pt)} of {len(orphaned_new_sv) + len(new_sv_pt)} sequence variants into the existing phylotypes."
+    )
     w = csv.writer(args.out)
     w.writerow(['phylotype', 'sv'])
     for sv, pt in new_sv_pt.items():
