@@ -11,6 +11,7 @@ from sklearn.cluster import AgglomerativeClustering
 import csv
 import taichi as ti
 import multiprocessing
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -71,8 +72,20 @@ class Jplace():
         self.__load_placements__()
 
     def __load_tree__(self):
+        # Have to be sure the "NAME" of each edge is not gunk but perfectly matched to the jplace
+        re_SEPP_tree = re.compile(r'(|\w+):(?P<edgelen>\d+\.\d+)(|e[-+]\d+)\[(?P<edgeid>\d+)\]')
+        
+        def normalized_edges(m):
+            return f"{{{m['edgeid']}}}:{m['edgelen']}[{m['edgeid']}]"
+        
+        
+        tree_norm = re_SEPP_tree.sub(
+            normalized_edges,
+            self.jplace['tree']
+        )
+        print (tree_norm)
         tp = Phylo.read(
-            StringIO(self.jplace['tree']),
+            StringIO(tree_norm),
             'newick'
         )
         with StringIO() as th:
