@@ -83,7 +83,6 @@ class Jplace():
             normalized_edges,
             self.jplace['tree']
         )
-        print (tree_norm)
         tp = Phylo.read(
             StringIO(tree_norm),
             'newick'
