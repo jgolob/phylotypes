@@ -73,7 +73,7 @@ class Jplace():
 
     def __load_tree__(self):
         # Have to be sure the "NAME" of each edge is not gunk but perfectly matched to the jplace
-        re_SEPP_tree = re.compile(r'(|\w+):(?P<edgelen>\d+\.\d+)(|e[-+]\d+)\[(?P<edgeid>\d+)\]')
+        re_SEPP_tree = re.compile(r'(|\w+):(?P<edgelen>(\d+\.\d+)(|e[-+]\d+))\[(?P<edgeid>\d+)\]')
         
         def normalized_edges(m):
             return f"{{{m['edgeid']}}}:{m['edgelen']}[{m['edgeid']}]"
