@@ -13,7 +13,14 @@ import taichi as ti
 import multiprocessing
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+rootLogger = logging.getLogger()
+rootLogger.setLevel(logging.INFO)
+logFormatter = logging.Formatter(
+    '%(asctime)s %(levelname)-8s [phylotypes] %(message)s'
+)
+consoleHandler = logging.StreamHandler()
+consoleHandler.setFormatter(logFormatter)
+rootLogger.addHandler(consoleHandler)
 
 
 # Taichi functions
@@ -156,7 +163,7 @@ class Jplace():
             )
             sv_to_group = [sv for sv in sv_to_group if sv not in group_svs]
             sv_groups.append(list(group_svs))
-            logging.info(f'{len(sv_to_group)} SVs remain to pregroup, with {len(group_node_ids)} nodes at this step')
+            logging.debug(f'{len(sv_to_group)} SVs remain to pregroup, with {len(group_node_ids)} nodes at this step')
 
         logging.info("Done pre-grouping features into {} groups, of which the largest is {} items".format(
             len(sv_groups),
@@ -197,7 +204,7 @@ class Jplace():
             ]))
             for olds in new_old_sv_groups.values()
         ]
-        logging.info("Now {} groups, with the largest {} items".format(
+        logging.debug("Now {} groups, with the largest {} items".format(
             len(new_sv_groups),
             max([
                 len(svg) for svg in new_sv_groups
@@ -220,7 +227,7 @@ class Jplace():
         logging.info("Starting phylogrouping")
         for g_i, g_sv in enumerate(self.sv_groups):
             if (g_i + 1) % 100 == 0:
-                logging.info("Group {} of {}".format(g_i, len(self.sv_groups)))
+                logging.debug("Group {} of {}".format(g_i, len(self.sv_groups)))
             if len(g_sv) == 1:
                 self.phylogroups.append(set(g_sv))
                 continue
