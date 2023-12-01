@@ -206,7 +206,7 @@ class Jplace():
         logging.info("Calculating pairwise phylogenetic distance between groups")
         g_lca_mat = np.zeros(
             shape=(len(sv_group_lca), len(sv_group_lca)),
-            dtype=np.float64
+            dtype=np.float32
         )
         for i in range(len(sv_group_lca)):
             for j in range(i + 1, len(sv_group_lca)):
@@ -251,7 +251,7 @@ class Jplace():
                 len(g_sv),
                 len(g_sv)
             ),
-            dtype=np.float64
+            dtype=np.float32
         )
 
         for i in range(len(g_sv)):
@@ -304,10 +304,10 @@ class Jplace():
                     len(overlap_nodes),
                     sv1_lwr_total,
                     sv2_lwr_total,
-                    np.array([sv1_p[n][0] for n in overlap_nodes], dtype=np.float64),
-                    np.array([sv1_p[n][1] for n in overlap_nodes], dtype=np.float64),
-                    np.array([sv2_p[n][0] for n in overlap_nodes], dtype=np.float64),
-                    np.array([sv2_p[n][1] for n in overlap_nodes], dtype=np.float64),
+                    np.array([sv1_p[n][0] for n in overlap_nodes], dtype=np.float32),
+                    np.array([sv1_p[n][1] for n in overlap_nodes], dtype=np.float32),
+                    np.array([sv2_p[n][0] for n in overlap_nodes], dtype=np.float32),
+                    np.array([sv2_p[n][1] for n in overlap_nodes], dtype=np.float32),
                 )
                 distant_nodes = set(sv1_p).union(set(sv2_p)) - set(sv1_p).intersection(set(sv2_p))
                 if len(distant_nodes) > 0:
@@ -326,12 +326,12 @@ class Jplace():
                             np[1] 
                             for nid, np in sv1_p.items()
                             if nid in distant_nodes
-                        ], dtype=np.float64),
+                        ], dtype=np.float32),
                         np.array([
                             svp_lca.distance(self.name_node[nid]) * np[0]
                             for nid, np in sv1_p.items()
                             if nid in distant_nodes
-                        ], dtype=np.float64),                        
+                        ], dtype=np.float32),                        
                     )
                     paired_dist += DistantNodePairedDistance(
                         sv2_lwr_total,
@@ -339,12 +339,12 @@ class Jplace():
                             np[1] 
                             for nid, np in sv2_p.items()
                             if nid in distant_nodes
-                        ], dtype=np.float64),
+                        ], dtype=np.float32),
                         np.array([
                             svp_lca.distance(self.name_node[nid]) * np[0]
                             for nid, np in sv2_p.items()
                             if nid in distant_nodes
-                        ], dtype=np.float64),                        
+                        ], dtype=np.float32),                        
                     )
 
                 g_sv_dist_mat[i, j] = paired_dist
