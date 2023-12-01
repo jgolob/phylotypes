@@ -39,6 +39,22 @@ def LWR_Filter(mat: ti.types.ndarray(), res: ti.types.ndarray(), threshold: floa
         else:
             res[i] = 0
 
+@ti.kernel
+def OverlappedNodePairedDistance(n_overlap: int, sv1_lwr_total: float, sv2_lwr_total: float, sv1_p_0: ti.types.ndarray(), sv1_p_1: ti.types.ndarray(), sv2_p_0: ti.types.ndarray(), sv2_p_1: ti.types.ndarray()) -> ti.f64:
+    pd_1 = 0.0
+    pd_2 = 0.0
+
+    for i in range(n_overlap):
+        pd_1 += sv1_p_1[i] * sv1_p_0[i]
+        pd_2 += sv2_p_1[i] * sv2_p_0[i]
+    return pd_1 / sv1_lwr_total + pd_2 / sv2_lwr_total
+
+@ti.kernel
+def DistantNodePairedDistance(lwr_total: float, sv_p1: ti.types.ndarray(), sv_lca_p0: ti.types.ndarray()) -> ti.f64:
+    pd = 0.0
+    for i in range(sv_p1.shape[0]):
+        pd += sv_p1[i] + sv_lca_p0[i]
+    return pd / lwr_total
 
 class Jplace():
     lwr_overlap = 0.1
@@ -216,7 +232,7 @@ class Jplace():
             ]))
             for olds in new_old_sv_groups.values()
         ]
-        logging.debug("Now {} groups, with the largest {} items".format(
+        logging.info("Now {} groups, with the largest {} items".format(
             len(new_sv_groups),
             max([
                 len(svg) for svg in new_sv_groups
@@ -284,10 +300,15 @@ class Jplace():
                 paired_dist = 0
                 # Overlapped nodes
                 overlap_nodes = set(sv1_p).intersection(set(sv2_p))
-                paired_dist += sum([
-                    sv1_p[n][1] * sv1_p[n][0] / sv1_lwr_total + sv2_p[n][1] * sv2_p[n][0] / sv2_lwr_total
-                    for n in overlap_nodes
-                ])
+                paired_dist += OverlappedNodePairedDistance(
+                    len(overlap_nodes),
+                    sv1_lwr_total,
+                    sv2_lwr_total,
+                    np.array([sv1_p[n][0] for n in overlap_nodes], dtype=np.float64),
+                    np.array([sv1_p[n][1] for n in overlap_nodes], dtype=np.float64),
+                    np.array([sv2_p[n][0] for n in overlap_nodes], dtype=np.float64),
+                    np.array([sv2_p[n][1] for n in overlap_nodes], dtype=np.float64),
+                )
                 distant_nodes = set(sv1_p).union(set(sv2_p)) - set(sv1_p).intersection(set(sv2_p))
                 if len(distant_nodes) > 0:
                     # Determine the lowest common ancestor of the distant nodes for this pair
@@ -298,16 +319,34 @@ class Jplace():
                         ]
                     )
                     # Add weighted average distance of SV1 to the LCA
-                    # and SV2 to the LCA to the paired_distacne
-                    paired_dist += (sum([
-                        (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
-                        for nid, np in sv1_p.items()
-                        if nid in distant_nodes
-                    ]) / sv1_lwr_total + sum([
-                        (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
-                        for nid, np in sv2_p.items()
-                        if nid in distant_nodes
-                    ]) / sv2_lwr_total)
+                    # and SV2 to the LCA to the paired_distace                   
+                    paired_dist += DistantNodePairedDistance(
+                        sv1_lwr_total,
+                        np.array([
+                            np[1] 
+                            for nid, np in sv1_p.items()
+                            if nid in distant_nodes
+                        ], dtype=np.float64),
+                        np.array([
+                            svp_lca.distance(self.name_node[nid]) * np[0]
+                            for nid, np in sv1_p.items()
+                            if nid in distant_nodes
+                        ], dtype=np.float64),                        
+                    )
+                    paired_dist += DistantNodePairedDistance(
+                        sv2_lwr_total,
+                        np.array([
+                            np[1] 
+                            for nid, np in sv2_p.items()
+                            if nid in distant_nodes
+                        ], dtype=np.float64),
+                        np.array([
+                            svp_lca.distance(self.name_node[nid]) * np[0]
+                            for nid, np in sv2_p.items()
+                            if nid in distant_nodes
+                        ], dtype=np.float64),                        
+                    )
+
                 g_sv_dist_mat[i, j] = paired_dist
                 g_sv_dist_mat[j, i] = paired_dist
 
@@ -341,9 +380,8 @@ class Jplace():
         self.__pregroup_by_LWR__(pd_threshold, lwr_overlap)
 
         # ----
+        logging.info(f"There are {len(self.sv_groups)} groups for phylotyping")
         logging.info("Starting phylogrouping")
-        #for g_i, g_sv in enumerate(self.sv_groups):
-        
         with Pool(threads) as pool:
             phylotypes_by_groups = pool.starmap(
                 self.__phylotypes_from_groups__,
