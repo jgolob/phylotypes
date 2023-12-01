@@ -12,6 +12,7 @@ import csv
 import taichi as ti
 from multiprocessing import Pool
 import re
+from itertools import combinations
 
 # Set up logging
 rootLogger = logging.getLogger()
@@ -379,26 +380,180 @@ class Jplace():
         logging.info("Pregrouping based on overlapping LWR for SV")
         self.__pregroup_by_LWR__(pd_threshold, lwr_overlap)
 
-        # ----
-        logging.info(f"There are {len(self.sv_groups)} groups for phylotyping")
-        logging.info("Starting phylogrouping")
+        logging.info("Identifying lonely SV (in groups of one)")
+        # For lonely SV (in groups of one) make them phylotypes
+        self.phylogroups = [
+            set(svg) for svg in self.sv_groups if len(svg) == 1
+        ]
+        logging.info("Generating grouped permutations between SV")
+        sv_pairs = []
+        for g_i, svg in enumerate(self.sv_groups):
+            if len(svg) == 1:
+                continue
+            # Implicit else
+            sv_pairs += [
+                    (
+                        g_i, # Group index
+                        sv[0], # SV0
+                        sv[1], # SV1
+                        set(self.sv_nodes[sv[0]].keys()).intersection(set(self.sv_nodes[sv[1]].keys())), # Overlapped Nodes
+                        set(self.sv_nodes[sv[0]].keys()).union(set(self.sv_nodes[sv[1]].keys())) - set(self.sv_nodes[sv[0]].keys()).intersection(set(self.sv_nodes[sv[1]].keys())), # Distant Nodes
+                        np.sum([npl[self.lwr_idx] for npl in self.sv_nodes[sv[0]].values()]), # sv0 LWR total
+                        np.sum([npl[self.lwr_idx] for npl in self.sv_nodes[sv[1]].values()]), # sv1 LWR total,
+
+                    )
+                    for sv in
+                    combinations(svg, 2)
+                ]
+        logging.info("Identifying lowest common ancestors between SV permutations")
+        sv_pairs_lca = [
+            self.tree.lowest_common_ancestor(
+                [
+                    self.name_node.get(nid)
+                    for nid in svp[4] # distant_nodes
+                ]
+            ) if len(svp[4]) > 0 else None
+            for svp in sv_pairs 
+        ]
+        logging.info("Overlapped distance calculation for SV pairs")
         with Pool(threads) as pool:
-            phylotypes_by_groups = pool.starmap(
-                self.__phylotypes_from_groups__,
+            pwd_oln = pool.starmap(
+                OverlappedNodePairedDistance, 
                 (
                     (
-                        svg,
-                        pd_threshold,
-                        no_dl,
+                        len(oln),
+                        sv0_lwr_total,
+                        sv1_lwr_total,
+                        np.array([
+                            pl[self.lwr_idx]
+                            for nid, pl in self.sv_nodes[sv0].items()
+                            if nid in oln
+                        ], dtype=np.float32),
+                        np.array([
+                            pl[self.dl_idx]
+                            for nid, pl in self.sv_nodes[sv0].items()
+                            if nid in oln
+                        ], dtype=np.float32),
+                        np.array([
+                            pl[self.lwr_idx]
+                            for nid, pl in self.sv_nodes[sv1].items()
+                            if nid in oln
+                        ], dtype=np.float32),
+                        np.array([
+                            pl[self.dl_idx]
+                            for nid, pl in self.sv_nodes[sv1].items()
+                            if nid in oln
+                        ], dtype=np.float32),
                     )
-                    for svg in self.sv_groups
+                    for g_i, sv0, sv1, oln, dn, sv0_lwr_total, sv1_lwr_total in sv_pairs
                 ),
+                chunksize=100
             )
-        self.phylogroups = [
-            v
-            for pg in phylotypes_by_groups
-            for v in pg
+        logging.info("Distant nodes distance for first SV")
+        with Pool(threads) as pool:
+            pwd_dn_0 = pool.starmap(
+                DistantNodePairedDistance, 
+                (
+                    (
+                        sv0_lwr_total,
+                        np.array([
+                            pl[self.dl_idx]
+                            for nid, pl in self.sv_nodes[sv0].items()
+                            if nid in dn
+                        ], dtype=np.float32),
+                        np.array([
+                            sv_pairs_lca[p_i].distance(self.name_node[nid]) * pl[self.lwr_idx]
+                            for nid, pl in self.sv_nodes[sv0].items()
+                            if nid in dn
+                        ], dtype=np.float32),
+                    ) if sv_pairs_lca[p_i] is not None else (
+                        sv0_lwr_total,
+                        np.array([], dtype=np.float32),
+                        np.array([], dtype=np.float32),
+                    )
+                    for p_i, (g_i, sv0, sv1, oln, dn, sv0_lwr_total, sv1_lwr_total) in enumerate(sv_pairs)
+                ),
+                chunksize=100
+            )
+        logging.info("Distant nodes distance for second SV")
+        with Pool(threads) as pool:
+            pwd_dn_1 = pool.starmap(
+                DistantNodePairedDistance, 
+                (
+                    (
+                        sv1_lwr_total,
+                        np.array([
+                            pl[self.dl_idx]
+                            for nid, pl in self.sv_nodes[sv1].items()
+                            if nid in dn
+                        ], dtype=np.float32),
+                        np.array([
+                            sv_pairs_lca[p_i].distance(self.name_node[nid]) * pl[self.lwr_idx]
+                            for nid, pl in self.sv_nodes[sv1].items()
+                            if nid in dn
+                        ], dtype=np.float32),
+                    ) if sv_pairs_lca[p_i] is not None else (
+                        sv1_lwr_total,
+                        np.array([], dtype=np.float32),
+                        np.array([], dtype=np.float32),
+                    )
+                    for p_i, (g_i, sv0, sv1, oln, dn, sv0_lwr_total, sv1_lwr_total) in enumerate(sv_pairs)
+                ),
+                chunksize=100
+            )            
+        
+        logging.info("Calculating pairwise distances")
+
+        pwd_l = [
+            (
+                sv_pairs[p_i][0], # Group
+                sv_pairs[p_i][1], # SV0
+                sv_pairs[p_i][2], # SV1
+                pwd_oln[p_i] + pwd_dn_0[p_i] + pwd_dn_1[p_i]
+            )
+            for p_i in range(len(sv_pairs))
         ]
+        groups = {
+            pwd[0]
+            for pwd in pwd_l
+        }
+        
+        for g_i in groups:
+            g_pwd_l = [pwd for pwd in pwd_l if pwd[0] == g_i]
+            g_sv = sorted({pwd[1] for pwd in g_pwd_l}.union({pwd[2] for pwd in g_pwd_l}))
+            g_sv_i = {
+                sv: i for
+                (i, sv) in enumerate(g_sv)
+            }
+            g_sv_dist_mat = np.zeros(
+                shape=(
+                    len(g_sv),
+                    len(g_sv)
+                ),
+                dtype=np.float32
+            )
+            for g, sv0, sv1, pd in g_pwd_l:
+                g_sv_dist_mat[
+                    g_sv_i.get(sv0),
+                    g_sv_i.get(sv1),
+                ] = pd
+                g_sv_dist_mat[
+                    g_sv_i.get(sv1),
+                    g_sv_i.get(sv0),
+                ] = pd
+            g_sv_clusters = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=pd_threshold,
+                metric='precomputed',
+                linkage='average'
+            ).fit_predict(g_sv_dist_mat)
+            g_phylotype_svs = defaultdict(set)
+            for sv, cl in zip(g_sv, g_sv_clusters):
+                g_phylotype_svs[cl].add(sv)
+            self.phylogroups += [
+                set(svs) for svs in g_phylotype_svs.values()
+            ]         
+
         return self.phylogroups
 
     def to_long(self):
