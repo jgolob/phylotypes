@@ -10,7 +10,7 @@ from collections import defaultdict
 from sklearn.cluster import AgglomerativeClustering
 import csv
 import taichi as ti
-import multiprocessing
+from multiprocessing import Pool
 import re
 
 # Set up logging
@@ -224,8 +224,113 @@ class Jplace():
         ))
         self.sv_groups = new_sv_groups
 
+    def __phylotypes_from_groups__(self, g_sv, pd_threshold, no_dl=False):
+        # Simple case of a single sv in this group, just assign it.
+        if len(g_sv) == 1:
+            return [set(g_sv)]
+        # Implicit else we have some work to do...
+        # If the length of the SV_group is greater than zero, cluster by pairwise PD
+        g_sv_dist_mat = np.zeros(
+            shape=(
+                len(g_sv),
+                len(g_sv)
+            ),
+            dtype=np.float64
+        )
+
+        for i in range(len(g_sv)):
+            sv1 = g_sv[i]
+            if no_dl:
+                sv1_p = {
+                    nid:
+                    (
+                        npl[self.lwr_idx],
+                        0
+                    )
+                    for nid, npl in self.sv_nodes[sv1].items()
+                }
+            else:
+                sv1_p = {
+                    nid:
+                    (
+                        npl[self.lwr_idx],
+                        npl[self.dl_idx]
+                    )
+                    for nid, npl in self.sv_nodes[sv1].items()
+                }
+            sv1_lwr_total = sum((p[0] for p in sv1_p.values()))
+            for j in range(i + 1, len(g_sv)):
+                sv2 = g_sv[j]
+                if no_dl:
+                    sv2_p = {
+                        nid:
+                        (
+                            npl[self.lwr_idx],
+                            0
+                        )
+                        for nid, npl in self.sv_nodes[sv2].items()
+                    }
+                else:
+                    sv2_p = {
+                        nid:
+                        (
+                            npl[self.lwr_idx],
+                            npl[self.dl_idx]
+                        )
+                        for nid, npl in self.sv_nodes[sv2].items()
+                    }
+                sv2_lwr_total = sum((p[0] for p in sv2_p.values()))
+                # Initialize the distance as zero
+                paired_dist = 0
+                # Overlapped nodes
+                overlap_nodes = set(sv1_p).intersection(set(sv2_p))
+                paired_dist += sum([
+                    sv1_p[n][1] * sv1_p[n][0] / sv1_lwr_total + sv2_p[n][1] * sv2_p[n][0] / sv2_lwr_total
+                    for n in overlap_nodes
+                ])
+                distant_nodes = set(sv1_p).union(set(sv2_p)) - set(sv1_p).intersection(set(sv2_p))
+                if len(distant_nodes) > 0:
+                    # Determine the lowest common ancestor of the distant nodes for this pair
+                    svp_lca = self.tree.lowest_common_ancestor(
+                        [
+                            self.name_node.get(nid)
+                            for nid in distant_nodes
+                        ]
+                    )
+                    # Add weighted average distance of SV1 to the LCA
+                    # and SV2 to the LCA to the paired_distacne
+                    paired_dist += (sum([
+                        (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
+                        for nid, np in sv1_p.items()
+                        if nid in distant_nodes
+                    ]) / sv1_lwr_total + sum([
+                        (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
+                        for nid, np in sv2_p.items()
+                        if nid in distant_nodes
+                    ]) / sv2_lwr_total)
+                g_sv_dist_mat[i, j] = paired_dist
+                g_sv_dist_mat[j, i] = paired_dist
+
+        # And use it for agglomerative clustering
+        g_sv_clusters = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=pd_threshold,
+            metric='precomputed',
+            linkage='average'
+        ).fit_predict(g_sv_dist_mat)
+        # Map
+        g_phylotype_svs = defaultdict(set)
+        for sv, cl in zip(g_sv, g_sv_clusters):
+            g_phylotype_svs[cl].add(sv)
+        
+        return [
+            set(svs) for svs in g_phylotype_svs.values()
+        ]
+
+        
+
     # Public methods
-    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False):
+    def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False, threads=None):
         # no_dl if true will ignore the remaining distance to nodes.
         if no_dl:
             logging.info("Ignoring distal length.")
@@ -237,108 +342,25 @@ class Jplace():
 
         # ----
         logging.info("Starting phylogrouping")
-        for g_i, g_sv in enumerate(self.sv_groups):
-            if (g_i + 1) % 100 == 0:
-                logging.debug("Group {} of {}".format(g_i, len(self.sv_groups)))
-            if len(g_sv) == 1:
-                self.phylogroups.append(set(g_sv))
-                continue
-            # If the length of the SV_group is greater than zero, cluster by pairwise PD
-            g_sv_dist_mat = np.zeros(
-                shape=(
-                    len(g_sv),
-                    len(g_sv)
+        #for g_i, g_sv in enumerate(self.sv_groups):
+        
+        with Pool(threads) as pool:
+            phylotypes_by_groups = pool.starmap(
+                self.__phylotypes_from_groups__,
+                (
+                    (
+                        svg,
+                        pd_threshold,
+                        no_dl,
+                    )
+                    for svg in self.sv_groups
                 ),
-                dtype=np.float64
             )
-            for i in range(len(g_sv)):
-                sv1 = g_sv[i]
-                if no_dl:
-                    sv1_p = {
-                        nid:
-                        (
-                            npl[self.lwr_idx],
-                            0
-                        )
-                        for nid, npl in self.sv_nodes[sv1].items()
-                    }
-                else:
-                    sv1_p = {
-                        nid:
-                        (
-                            npl[self.lwr_idx],
-                            npl[self.dl_idx]
-                        )
-                        for nid, npl in self.sv_nodes[sv1].items()
-                    }
-                sv1_lwr_total = sum((p[0] for p in sv1_p.values()))
-                for j in range(i + 1, len(g_sv)):
-                    sv2 = g_sv[j]
-                    if no_dl:
-                        sv2_p = {
-                            nid:
-                            (
-                                npl[self.lwr_idx],
-                                0
-                            )
-                            for nid, npl in self.sv_nodes[sv2].items()
-                        }
-                    else:
-                        sv2_p = {
-                            nid:
-                            (
-                                npl[self.lwr_idx],
-                                npl[self.dl_idx]
-                            )
-                            for nid, npl in self.sv_nodes[sv2].items()
-                        }
-                    sv2_lwr_total = sum((p[0] for p in sv2_p.values()))
-                    # Initialize the distance as zero
-                    paired_dist = 0
-                    # Overlapped nodes
-                    overlap_nodes = set(sv1_p).intersection(set(sv2_p))
-                    paired_dist += sum([
-                        sv1_p[n][1] * sv1_p[n][0] / sv1_lwr_total + sv2_p[n][1] * sv2_p[n][0] / sv2_lwr_total
-                        for n in overlap_nodes
-                    ])
-                    distant_nodes = set(sv1_p).union(set(sv2_p)) - set(sv1_p).intersection(set(sv2_p))
-                    if len(distant_nodes) > 0:
-                        # Determine the lowest common ancestor of the distant nodes for this pair
-                        svp_lca = self.tree.lowest_common_ancestor(
-                            [
-                                self.name_node.get(nid)
-                                for nid in distant_nodes
-                            ]
-                        )
-                        # Add weighted average distance of SV1 to the LCA
-                        # and SV2 to the LCA to the paired_distacne
-                        paired_dist += (sum([
-                            (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
-                            for nid, np in sv1_p.items()
-                            if nid in distant_nodes
-                        ]) / sv1_lwr_total + sum([
-                            (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
-                            for nid, np in sv2_p.items()
-                            if nid in distant_nodes
-                        ]) / sv2_lwr_total)
-                    g_sv_dist_mat[i, j] = paired_dist
-                    g_sv_dist_mat[j, i] = paired_dist
-
-            # And use it for agglomerative clustering
-            g_sv_clusters = AgglomerativeClustering(
-                n_clusters=None,
-                distance_threshold=pd_threshold,
-                metric='precomputed',
-                linkage='average'
-            ).fit_predict(g_sv_dist_mat)
-            # Map
-            g_phylotype_svs = defaultdict(set)
-            for sv, cl in zip(g_sv, g_sv_clusters):
-                g_phylotype_svs[cl].add(sv)
-            # And append the groups to the phylogroups list
-            self.phylogroups += [
-                svs for svs in g_phylotype_svs.values()
-            ]
+        self.phylogroups = [
+            v
+            for pg in phylotypes_by_groups
+            for v in pg
+        ]
         return self.phylogroups
 
     def to_long(self):
@@ -395,6 +417,11 @@ def main():
         default=0.1,
         type=float,
     )
+    args_parser.add_argument(
+        '--cpus', '-C',
+        help='Number of CPUs / threads to use. Default is all available.',
+        default=None,
+    )    
     args_parser.add_argument(
         '--no-distal-length', '-ndl',
         help='Ignore distal length to nodes. (Default: False)',
