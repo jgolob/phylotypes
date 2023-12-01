@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setuptools.setup(
     name="phylotypes",
-    version="1.0.0",
+    version="1.1.0",
     author="Jonathan Louis Golob",
     author_email="j-dev@golob.org",
     description="Group phylogenetically placed sequence variants into phylotypes",
@@ -29,11 +29,13 @@ setuptools.setup(
         'numpy',
         'scikit-learn>=1.3.0',
         'taichi',
+        'pandas',
     ],
     entry_points={
         'console_scripts': [
             'phylotypes=phylotypes.phylotypes:main',
             'add_phylotypes=phylotypes.add_phylotypes:main',
+            'phylotype_taxonomy=phylotypes.phylotype_taxonomy:main'
         ],
     },
 )
