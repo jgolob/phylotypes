@@ -673,7 +673,7 @@ def main():
     )
     args = args_parser.parse_args()
     jplace = Jplace(args.jplace)
-    jplace.group_features(args.lwr_overlap, args.threshold_pd, no_dl=args.no_distal_length)
+    jplace.group_features(args.lwr_overlap, args.threshold_pd, no_dl=args.no_distal_length, threads=args.cpus)
     logging.info("Done Phylogrouping. Outputting.")
     jplace.to_csv(args.out)
     logging.info("DONE!")
