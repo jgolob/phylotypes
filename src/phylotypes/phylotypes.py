@@ -13,6 +13,7 @@ import taichi as ti
 from multiprocessing import Pool
 import re
 from itertools import combinations
+import os
 
 # Set up logging
 rootLogger = logging.getLogger()
@@ -24,7 +25,7 @@ consoleHandler = logging.StreamHandler()
 consoleHandler.setFormatter(logFormatter)
 rootLogger.addHandler(consoleHandler)
 
-LARGE_GROUP = 10
+LARGE_GROUP = 1000
 
 # Taichi functions
 ti.init()
@@ -368,7 +369,12 @@ class Jplace():
             set(svs) for svs in g_phylotype_svs.values()
         ]
 
-        
+    # Need a wrapper to handle edge case of a zero length list of nodes      
+    def lca_wrapper(self, dn):
+        if len(dn) == 0:
+            return None
+        else:
+                self.tree.lowest_common_ancestor(dn)
 
     # Public methods
     def group_features(self, lwr_overlap=0.95, pd_threshold=0.1, no_dl=False, threads=None):
@@ -419,25 +425,25 @@ class Jplace():
 
                 if len(svg) > LARGE_GROUP:
                     logging.info(f"Identifying lowest common ancestors between SV {len(sv_pairs):,d} permutations")
-                sv_pairs_lca = [
-                    self.tree.lowest_common_ancestor(
-                        [
-                            self.name_node.get(nid)
-                            for nid in dn # distant_nodes
-                        ]
-                    ) if len(dn) > 0 else None
-
-                    for dn in (  # Distant nodes generator
-                        set(
-                            self.sv_nodes[svg[sv0]].keys()).union(
-                                set(self.sv_nodes[svg[sv1]].keys()
+                sv_pairs_lca = list(
+                    pool.imap(
+                        self.lca_wrapper,
+                        (
+                            [self.name_node.get(nid) for nid in dn]
+                            for dn in (  # Distant nodes generator
+                                set(
+                                    self.sv_nodes[svg[sv0]].keys()).union(
+                                        set(self.sv_nodes[svg[sv1]].keys()
+                                    )
+                                ) - set(
+                                    self.sv_nodes[svg[sv0]].keys()).intersection(set(self.sv_nodes[svg[sv1]].keys())
+                                ) # Distant Nodes
+                                for (sv0, sv1) in sv_pairs
                             )
-                        ) - set(
-                            self.sv_nodes[svg[sv0]].keys()).intersection(set(self.sv_nodes[svg[sv1]].keys())
-                        ) # Distant Nodes
-                        for (sv0, sv1) in sv_pairs
-                    )
-                ]
+                        ),
+                        chunksize=100,
+                    ),
+                )
 
                 if len(svg) > LARGE_GROUP:
                     logging.info("Overlapped distance calculation for SV pairs")
@@ -481,7 +487,7 @@ class Jplace():
                             for sv0, sv1 in sv_pairs
                         )
                     ),
-                    chunksize=threads
+                    chunksize=100
                 )
 
                 if len(svg) > LARGE_GROUP:
@@ -522,7 +528,7 @@ class Jplace():
                             for sv0, sv1 in sv_pairs
                         ))
                     ),
-                    chunksize=threads
+                    chunksize=100
                 )
 
                 if len(svg) > LARGE_GROUP:
@@ -658,7 +664,7 @@ def main():
     args_parser.add_argument(
         '--cpus', '-C',
         help='Number of CPUs / threads to use. Default is all available.',
-        default=None,
+        default=os.cpu_count(),
     )    
     args_parser.add_argument(
         '--no-distal-length', '-ndl',
