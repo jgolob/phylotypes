@@ -441,7 +441,7 @@ class Jplace():
                                 for (sv0, sv1) in sv_pairs
                             )
                         ),
-                        chunksize=100,
+                        chunksize=10,
                     ),
                 )
 
@@ -487,7 +487,7 @@ class Jplace():
                             for sv0, sv1 in sv_pairs
                         )
                     ),
-                    chunksize=100
+                    chunksize=10
                 )
 
                 if len(svg) > LARGE_GROUP:
@@ -528,7 +528,7 @@ class Jplace():
                             for sv0, sv1 in sv_pairs
                         ))
                     ),
-                    chunksize=100
+                    chunksize=10
                 )
 
                 if len(svg) > LARGE_GROUP:
@@ -569,7 +569,7 @@ class Jplace():
                             for sv0, sv1 in sv_pairs
                         ))
                     ),
-                    chunksize=100
+                    chunksize=10
                 )            
                 
                 if len(svg) > LARGE_GROUP:
@@ -665,6 +665,7 @@ def main():
         '--cpus', '-C',
         help='Number of CPUs / threads to use. Default is all available.',
         default=os.cpu_count(),
+        type=int,
     )    
     args_parser.add_argument(
         '--no-distal-length', '-ndl',
