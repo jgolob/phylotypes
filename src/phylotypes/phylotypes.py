@@ -441,7 +441,7 @@ class Jplace():
                                 for (sv0, sv1) in sv_pairs
                             )
                         ),
-                        chunksize=10,
+                        chunksize=10000,
                     ),
                 )
 
