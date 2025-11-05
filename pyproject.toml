@@ -47,3 +47,104 @@ dev = [
     "ruff (>=0.14.3,<0.15.0)",
     "pre-commit (>=4.3.0,<5.0.0)"
 ]
+
+# Ruff linting and formatting configuration (Google style)
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+src = ["src"]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "D",   # pydocstyle
+    "UP",  # pyupgrade
+    "YTT", # flake8-2020
+    "ANN", # flake8-annotations
+    "S",   # flake8-bandit
+    "BLE", # flake8-blind-except
+    "FBT", # flake8-boolean-trap
+    "B",   # flake8-bugbear
+    "A",   # flake8-builtins
+    "COM", # flake8-commas
+    "C4",  # flake8-comprehensions
+    "DTZ", # flake8-datetimez
+    "T10", # flake8-debugger
+    "EM",  # flake8-errmsg
+    "EXE", # flake8-executable
+    "FA",  # flake8-future-annotations
+    "ISC", # flake8-implicit-str-concat
+    "ICN", # flake8-import-conventions
+    "G",   # flake8-logging-format
+    "INP", # flake8-no-pep420
+    "PIE", # flake8-pie
+    "T20", # flake8-print
+    "PYI", # flake8-pyi
+    "Q",   # flake8-quotes
+    "RSE", # flake8-raise
+    "RET", # flake8-return
+    "SIM", # flake8-simplify
+    "TID", # flake8-tidy-imports
+    "ARG", # flake8-unused-arguments
+    "PTH", # flake8-use-pathlib
+    "TD",  # flake8-todos
+    "FIX", # flake8-fixme
+    "ERA", # eradicate
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "ANN",    # All flake8-annotations (missing annotations for self/cls)
+    "D100",   # missing docstring in public module
+    "D104",   # missing docstring in public package
+    "D107",   # missing docstring in __init__
+    "TD002",  # missing author in TODO
+    "TD003",  # missing issue link on line following TODO
+    "FIX002", # line contains TODO
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["D104", "F401"]
+"tests/**/*" = ["S101", "D", "S603", "S607"]
+"examples/**/*" = ["T201", "D"]
+
+[tool.ruff.mccabe]
+max-complexity = 10
+
+[tool.ruff.pydocstyle]
+convention = "google"
+
+[tool.ruff.isort]
+known-first-party = ["phylotypes"]
+force-sort-within-sections = true
+
+# MyPy type checking configuration (Google style)
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "biopython.*",
+    "skbio.*",
+    "sklearn.*",
+    "torch.*",
+    "pandas.*",
+]
+ignore_missing_imports = true
+
+# Pre-commit hooks are configured in .pre-commit-config.yaml
+# Install pre-commit hooks with: pre-commit install
+# Run hooks on all files with: pre-commit run --all-files
