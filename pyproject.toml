@@ -41,3 +41,9 @@ phylotype_taxonomy = "phylotypes.phylotype_taxonomy:main"
 
 [tool.poetry]
 packages = [{include = "phylotypes", from = "src"}]
+[dependency-groups]
+dev = [
+    "mypy (>=1.18.2,<2.0.0)",
+    "ruff (>=0.14.3,<0.15.0)",
+    "pre-commit (>=4.3.0,<5.0.0)"
+]
