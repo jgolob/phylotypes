@@ -45,6 +45,6 @@ repos:
         files: "^src/"
 
 # Configuration settings
-default_install_hook_types: ["pre-commit", "pre-push"]
+default_install_hook_types: ["pre-commit"]
 fail_fast: false
 minimum_pre_commit_version: "4.3.0"
