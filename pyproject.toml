@@ -50,9 +50,11 @@ dev = [
 
 # Ruff linting and formatting configuration (Google style)
 [tool.ruff]
-line-length = 88
-target-version = "py39"
+line-length = 120
+target-version = "py310"
 src = ["src"]
+
+[tool.ruff.lint]
 select = [
     "E",   # pycodestyle errors
     "W",   # pycodestyle warnings
@@ -102,26 +104,27 @@ ignore = [
     "TD002",  # missing author in TODO
     "TD003",  # missing issue link on line following TODO
     "FIX002", # line contains TODO
+    "COM812",
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["D104", "F401"]
 "tests/**/*" = ["S101", "D", "S603", "S607"]
 "examples/**/*" = ["T201", "D"]
 
-[tool.ruff.mccabe]
+[tool.ruff.lint.mccabe]
 max-complexity = 10
 
-[tool.ruff.pydocstyle]
+[tool.ruff.lint.pydocstyle]
 convention = "google"
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["phylotypes"]
 force-sort-within-sections = true
 
 # MyPy type checking configuration (Google style)
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
