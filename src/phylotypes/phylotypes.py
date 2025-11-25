@@ -175,10 +175,11 @@ class Phylotypes:
             logging.error(f"Missing required field: {e}. Required: edge_num, like_weight_ratio, distal_length")
             return
 
-        logging.info("Loading tree")
-        self._load_tree()
         logging.info("Loading and caching placements")
         self._load_placements()
+        logging.info("Loading tree")
+        self._load_tree()
+
 
     def _load_tree(self) -> None:
         """
@@ -214,18 +215,15 @@ class Phylotypes:
             logging.error(f"Failed to parse phylogenetic tree: {e}")
             return
 
-        # Create node mappings
+        # Cleanup node names...
         for node in self.tree.traverse():
-            node.name = int(node.name.replace("{", "").replace("}", ""))
+            node.name = node.name.replace("{", "").replace("}", "")
 
         self.name_node = {n.name: n for n in self.tree.traverse() if n.name is not None}
         self.node_name = {v: k for k, v in self.name_node.items()}
-        # And list / vector based lookups of node *names*
-        self.node_names = sorted(str(k) for k in self.name_node.keys())
-        self.node_name_to_idx = {name: idx for idx, name in enumerate(self.node_names)}
 
         # Generate tree node distance matrix and node indexing
-        self._generate_tree_node_distance_matrix()
+        #self._generate_tree_node_distance_matrix()
 
     def _generate_tree_node_distance_matrix(self) -> None:
         """
@@ -241,17 +239,18 @@ class Phylotypes:
             logging.warning("No tree loaded, cannot generate distance matrix")
             return
         # Implict else
-        logging.info("Starting pairwise tree node distance matrix generation")
+        
         n_nodes = len(self.node_names)
+        logging.info("Starting pairwise tree node distance matrix generation on %d nodes, or %d pairs", n_nodes, n_nodes**2)
 
         # Initialize tree node distance matrix on CPU
         self.tree_node_distance_matrix = torch.zeros((n_nodes, n_nodes), dtype=torch.float32)
 
         # Simple O(n^2) approach
         for i, node_name_i in enumerate(self.node_names):
-            node_i = self.name_node[int(node_name_i)]
+            node_i = self.name_node[node_name_i]
             for j, node_name_j in enumerate(self.node_names[i + 1 :], start=i + 1):
-                node_j = self.name_node[int(node_name_j)]
+                node_j = self.name_node[node_name_j]
                 pdist = node_i.distance(node_j)
                 self.tree_node_distance_matrix[i, j] = pdist
                 self.tree_node_distance_matrix[j, i] = pdist
@@ -289,6 +288,15 @@ class Phylotypes:
                 for sv in pl["n"]:
                     self.sv_nodes[sv] = pl_nodes
 
+        # And list / vector based lookups of node *names*
+        self.node_names = sorted({
+            str(node_name)
+            for pl in self.sv_nodes.values()
+            for node_name in pl.keys()
+        })
+        self.node_name_to_idx = {name: idx for idx, name in enumerate(self.node_names)}
+
+
         self._build_placement_tensors()
 
     def _build_placement_tensors(self) -> None:
@@ -324,8 +332,15 @@ class Phylotypes:
                     dtype=torch.float32,
                 )
             )
+        
+        self.placement_present = self.placement_lwr > 0
 
-    def pairwise_emd(self, distal_length: bool = True) -> torch.Tensor:
+
+    def pairwise_emd(
+            self,
+            placement_indices: Optional[List[int]] = None,
+            distal_length: bool = True,
+        ) -> torch.Tensor:
         """
         Calculate the pairwise Earth Mover's Distance between all pairs of placements in a fully vectorized manner.
 
@@ -335,11 +350,11 @@ class Phylotypes:
             torch.Tensor: A tensor of shape (n_placements, n_placements) containing the EMD values between all pairs of placements
         """
         if not hasattr(self, "placement_lwr"):
-            raise ValueError("Placement Tensors need to be built first")
-        if not hasattr(self, "tree_node_distance_matrix"):
-            raise ValueError("Tree Pairwise Distance Tensor must be created first")
+            raise ValueError("Placement Tensor need to be built first")
+        if not hasattr(self, "placement_present"):
+            raise ValueError("Placement present tensor must be build")
         if distal_length and not hasattr(self, "placement_dl"):
-            raise ValueError("Placement distal length tendors need to be built")
+            raise ValueError("Placement distal length tensor need to be built")
 
         # Implicit else we have needed attributes
         # Expand dimensions for broadcasting
@@ -378,10 +393,16 @@ class Phylotypes:
         """
         # Sort features by number of placements (ascending)
         sv_to_group = [
-            sv
-            for sv, svp_l in sorted(
-                [(sv, len(svp)) for sv, svp in self.sv_nodes.items()],
-                key=lambda v: v[1],
+            v[0]
+            for v in 
+            sorted([
+                (sv, num_nodes)
+                for (sv, num_nodes) in zip(
+                    self.placement_names,
+                    self.placement_present.sum(dim=1).cpu().numpy()
+                )
+            ],
+            key=lambda v: v[1]
             )
         ]
 
