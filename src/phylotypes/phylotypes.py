@@ -374,6 +374,7 @@ class Phylotypes:
             raise ValueError("Placement present tensor must be build")
         if distal_length and not hasattr(self, "placement_dl"):
             raise ValueError("Placement distal length tensor need to be built")
+            # Implicit else we have needed attributes
 
         # Subset based on provided indices if provided
         if placement_indices is not None:
@@ -387,8 +388,6 @@ class Phylotypes:
         subset_node_idx_w_weight = subset_placement_lwr.amax(dim=0).nonzero().squeeze()
         subset_placement_lwr = subset_placement_lwr[:, subset_node_idx_w_weight]
         subset_dl = subset_dl[:, subset_node_idx_w_weight]
-        # Implicit else we have needed attributes
-        # Expand dimensions for broadcasting
 
         # Handle the edge case where all the weight for these placements is on *one* node
         # i.e., the dim of subset_node_idx_w_weight is 0
@@ -404,17 +403,19 @@ class Phylotypes:
                 emd_matrix = subset_dl.unsqueeze(1) + subset_dl.unsqueeze(0)
                 torch.diagonal(emd_matrix).fill_(0.0)
                 return emd_matrix
+
+        logging.info(f"Building tree distance matrix {subset_node_idx_w_weight.shape[0]} nodes.")
+        tree_node_distance_matrix = self._get_tree_node_distance_matrix(list(subset_node_idx_w_weight))
+
+        # Expand dimensions for broadcasting
         logging.info(
             f"Calculating flows for {subset_placement_lwr.shape[0]} placements over {subset_placement_lwr.shape[1]} nodes."
         )
         # Implicit else there are more than one nodes with placement...
         P_a_i = subset_placement_lwr.unsqueeze(1).unsqueeze(3)  # Shape ([n_placement, 1, n_nodes, 1])
         P_b_j = subset_placement_lwr.unsqueeze(0).unsqueeze(2)  # Shape ([1, n_placement, 1, n_nodes])
-
-        flows = P_a_i * P_b_j  # Shape ([n_placement, n_placement, n_node, n_node])
-
-        logging.info("Building tree distance matrix")
-        tree_node_distance_matrix = self._get_tree_node_distance_matrix(list(subset_node_idx_w_weight))
+        flows = torch.einsum("ij,kl->ikjl", P_a_i.squeeze(), P_b_j.squeeze())
+        # flows = P_a_i * P_b_j  # Shape ([n_placement, n_placement, n_node, n_node])
 
         if distal_length:
             # distal_length_a_i shape: (n_placements, 1, n_nodes, 1)
