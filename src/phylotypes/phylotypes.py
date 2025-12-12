@@ -345,7 +345,7 @@ class Phylotypes:
         self,
         placement_indices: Optional[List[int]] = None,
         distal_length: bool = True,
-        batch_size: int = 100,
+        batch_size: int = 10,
     ) -> torch.Tensor:
         """
         Calculate the pairwise Earth Mover's Distance between all pairs of placements in a fully vectorized manner.
@@ -420,17 +420,26 @@ class Phylotypes:
                 # Extract batches
                 batch_i = subset_placement_lwr[i : i + batch_size]
                 batch_j = subset_placement_lwr[j : j + batch_size]
+                # And limit to notes in this batch
+                batch_nodes_idx = torch.vstack([batch_i, batch_j]).amax(dim=0).nonzero().squeeze()
+                # And then limit again!
+                batch_i = batch_i[:, batch_nodes_idx]
+                batch_j = batch_j[:, batch_nodes_idx]
                 # Compute flows for the batch
                 P_a_i = batch_i.unsqueeze(1).unsqueeze(3)  # Shape: [batch_i, 1, n_nodes, 1]
                 P_b_j = batch_j.unsqueeze(0).unsqueeze(2)  # Shape: [1, batch_j, 1, n_nodes]
                 flows = P_a_i * P_b_j  # Shape: [batch_i, batch_j, n_nodes, n_nodes]
                 # Compute adjusted tree distances
                 if distal_length:
-                    distal_length_a_i = subset_dl[i : i + batch_size].unsqueeze(1).unsqueeze(3)
-                    distal_length_b_j = subset_dl[j : j + batch_size].unsqueeze(0).unsqueeze(2)
-                    adjusted_tree_distances = tree_node_distance_matrix + distal_length_a_i + distal_length_b_j  # type: ignore
+                    distal_length_a_i = subset_dl[i : i + batch_size, batch_nodes_idx].unsqueeze(1).unsqueeze(3)
+                    distal_length_b_j = subset_dl[j : j + batch_size, batch_nodes_idx].unsqueeze(0).unsqueeze(2)
+                    adjusted_tree_distances = (
+                        tree_node_distance_matrix[batch_nodes_idx, batch_nodes_idx]  # type: ignore
+                        + distal_length_a_i
+                        + distal_length_b_j
+                    )
                 else:
-                    adjusted_tree_distances = tree_node_distance_matrix  # type: ignore
+                    adjusted_tree_distances = tree_node_distance_matrix[batch_nodes_idx, batch_nodes_idx]  # type: ignore
                 # Compute weighted distances and sum
                 weighted_dist = flows * adjusted_tree_distances
                 emd_batch = torch.sum(weighted_dist, dim=(2, 3))  # Shape: [batch_i, batch_j]
