@@ -44,38 +44,6 @@ console_handler.setFormatter(log_formatter)
 root_logger.addHandler(console_handler)
 
 
-def LWR_Filter(mat: Union[np.ndarray, torch.Tensor], threshold: float) -> np.ndarray:
-    """
-    Filter matrix rows based on likelihood weight ratio threshold.
-
-    This function converts input to PyTorch tensor, calculates row sums,
-    and creates a boolean mask where rows meeting the threshold are marked.
-
-    Args:
-        mat: Input matrix as numpy array
-        threshold: Minimum row sum threshold for inclusion
-
-    Returns:
-        Binary mask as numpy array (0s and 1s)
-
-    Raises:
-        TypeError: If mat cannot be converted to tensor
-        ValueError: If threshold is negative
-    """
-    # Convert numpy array to PyTorch tensor if needed
-    if not isinstance(mat, torch.Tensor):
-        mat = torch.from_numpy(mat)
-
-    # Calculate row sums
-    row_sums = torch.sum(mat, dim=1)
-
-    # Create boolean mask for rows where sum >= threshold
-    result_mask = row_sums >= threshold
-
-    # Convert to int (0 or 1) and return as numpy array
-    return result_mask.int().cpu().numpy()
-
-
 class Phylotypes:
     """
     A class for generating phylotypes from phylogenetic placement data.
@@ -84,33 +52,59 @@ class Phylotypes:
     placements and groups features into phylotypes based on phylogenetic
     distance and likelihood weight ratios.
 
-    Attributes:
-        lwr_overlap: Minimum likelihood weight ratio overlap threshold
-        pd_threshold: Phylogenetic distance threshold for clustering
-        phylogroups: List of phylotype groups (sets of feature names)
-        sv_groups: List of pre-grouped features by LWR overlap
-        jplace: Loaded JPLACE data dictionary
-        tree: Phylogenetic tree as TreeNode object
-        edge_idx: Index of edge_num field in placement data
-        lwr_idx: Index of like_weight_ratio field in placement data
-        dl_idx: Index of distal_length field in placement data
-        sv_nodes: Dictionary mapping feature names to placement nodes
-        name_node: Dictionary mapping node IDs to TreeNode objects
-        node_name: Dictionary mapping TreeNode objects to node IDs
-        node_names: List of node names in consistent order for tree node distance matrix
-        node_name_to_idx: Dictionary mapping node names to their index in node_names
-        tree_node_distance_matrix: torch tensor of shape (n_nodes, n_nodes) with pairwise tree node distances
+    Parameters
+    ----------
+    lwr_overlap : float, optional
+        Minimum likelihood weight ratio overlap threshold (default: 0.1)
+    pd_threshold : float, optional
+        Phylogenetic distance threshold for clustering (default: 1.0)
+
+    Attributes
+    ----------
+    lwr_overlap : float
+        Minimum likelihood weight ratio overlap threshold
+    pd_threshold : float
+        Phylogenetic distance threshold for clustering
+    phylogroups : List[Set[str]]
+        List of phylotype groups (sets of feature names)
+    sv_groups : List[List[str]]
+        List of pre-grouped features by LWR overlap
+    jplace : Dict[str, Any]
+        Loaded JPLACE data dictionary
+    tree : Optional[TreeNode]
+        Phylogenetic tree as TreeNode object
+    edge_idx : int
+        Index of edge_num field in placement data
+    lwr_idx : int
+        Index of like_weight_ratio field in placement data
+    dl_idx : int
+        Index of distal_length field in placement data
+    sv_nodes : Dict[str, Dict[int, List[float]]]
+        Dictionary mapping feature names to placement nodes
+    name_node : Dict[int, TreeNode]
+        Dictionary mapping node IDs to TreeNode objects
+    node_name : Dict[TreeNode, int]
+        Dictionary mapping TreeNode objects to node IDs
+    node_names : List[str]
+        List of node names in consistent order for tree node distance matrix
+    node_name_to_idx : Dict[str, int]
+        Dictionary mapping node names to their index in node_names
+    tree_node_distance_matrix : Optional[torch.Tensor]
+        torch tensor of shape (n_nodes, n_nodes) with pairwise tree node distances
     """
+
+    required_fields = ["fields", "placements", "tree"]
 
     def __init__(self, lwr_overlap: float = 0.1, pd_threshold: float = 1.0) -> None:
         """
         Initialize Phylotypes instance with clustering parameters.
 
-        Args:
-            lwr_overlap: Minimum likelihood weight ratio overlap for initial grouping
-                         (default: 0.1)
-            pd_threshold: Phylogenetic distance threshold for final clustering
-                         (default: 1.0)
+        Parameters
+        ----------
+        lwr_overlap : float, optional
+            Minimum likelihood weight ratio overlap for initial grouping (default: 0.1)
+        pd_threshold : float, optional
+            Phylogenetic distance threshold for final clustering (default: 1.0)
         """
         # Clustering parameters
         self.lwr_overlap: float = lwr_overlap
@@ -127,13 +121,17 @@ class Phylotypes:
         self.lwr_idx: int = 0
         self.dl_idx: int = 0
         self.sv_nodes: Dict[str, Dict[int, List[float]]] = {}
-        self.name_node: Dict[int, TreeNode] = {}
-        self.node_name: Dict[TreeNode, int] = {}
+        self.name_node: Dict[str, TreeNode] = {}
+        self.node_name: Dict[TreeNode, str] = {}
 
         # Tree node distance matrix and node indexing
         self.node_names: List[str] = []
         self.node_name_to_idx: Dict[str, int] = {}
         self.tree_node_distance_matrix: Optional[torch.Tensor] = None
+
+        # Groupings
+        self._pregrouped_sv: List[List[int]] = []
+        self._pregroup_lca: List[TreeNode] = []
 
     def load_jplace(self, jplace_fh: TextIO) -> None:
         """
@@ -142,14 +140,17 @@ class Phylotypes:
         Reads a JPLACE file handle, validates required fields, indexes field
         positions, loads the phylogenetic tree, and caches placement data.
 
-        Args:
-            jplace_fh: File handle for JPLACE file (opened in text mode)
+        Parameters
+        ----------
+        jplace_fh : TextIO
+            File handle for JPLACE file (opened in text mode)
 
-        Note:
-            This method validates the presence of required JPLACE fields:
-            - 'fields': Column headers for placement data
-            - 'placements': List of feature placements
-            - 'tree': Newick-formatted phylogenetic tree
+        Notes
+        -----
+        This method validates the presence of required JPLACE fields:
+        - 'fields': Column headers for placement data
+        - 'placements': List of feature placements
+        - 'tree': Newick-formatted phylogenetic tree
         """
         logging.info("Loading jplace file")
 
@@ -160,8 +161,8 @@ class Phylotypes:
             return
 
         # Validate required fields
-        required_fields = ["fields", "placements", "tree"]
-        for field in required_fields:
+
+        for field in self.required_fields:
             if field not in self.jplace:
                 logging.error(f"Missing required '{field}' entry in jplace. Exiting")
                 return
@@ -180,7 +181,6 @@ class Phylotypes:
         logging.info("Loading tree")
         self._load_tree()
 
-
     def _load_tree(self) -> None:
         """
         Load and normalize phylogenetic tree from JPLACE data.
@@ -189,8 +189,10 @@ class Phylotypes:
         names for consistent parsing, and creates TreeNode structures with
         mappings between node IDs and TreeNode objects.
 
-        Raises:
-            ValueError: If tree parsing fails
+        Raises
+        ------
+        ValueError
+            If tree parsing fails
         """
         # Regular expression to match SEPP tree format
         re_sepp_tree = re.compile(r"(|\w+):(?P<edgelen>(\d+\.\d+)(|e[-+]\d+))\[(?P<edgeid>\d+)\]")
@@ -222,10 +224,10 @@ class Phylotypes:
         self.name_node = {n.name: n for n in self.tree.traverse() if n.name is not None}
         self.node_name = {v: k for k, v in self.name_node.items()}
 
-        # Generate tree node distance matrix and node indexing
-        #self._generate_tree_node_distance_matrix()
-
-    def _generate_tree_node_distance_matrix(self) -> None:
+    def _get_tree_node_distance_matrix(
+        self,
+        node_indices: Optional[List[int]] = None,
+    ) -> Optional[torch.Tensor]:
         """
         Generate pairwise tree node distances
 
@@ -237,29 +239,30 @@ class Phylotypes:
         """
         if self.tree is None or self.node_names is None or self.node_name_to_idx is None:
             logging.warning("No tree loaded, cannot generate distance matrix")
-            return
+            return None
         # Implict else
-        
-        n_nodes = len(self.node_names)
-        logging.info("Starting pairwise tree node distance matrix generation on %d nodes, or %d pairs", n_nodes, n_nodes**2)
 
-        # Initialize tree node distance matrix on CPU
-        self.tree_node_distance_matrix = torch.zeros((n_nodes, n_nodes), dtype=torch.float32)
+        if node_indices is not None:
+            node_names = [self.node_names[nid] for nid in node_indices]
+        else:
+            node_names = self.node_names
+
+        n_nodes = len(node_names)
+        logging.info(
+            "Starting pairwise tree node distance matrix generation on %d nodes, or %d pairs", n_nodes, n_nodes**2
+        )
+
+        tree_node_distance_matrix = torch.zeros((n_nodes, n_nodes), dtype=torch.float32)
 
         # Simple O(n^2) approach
-        for i, node_name_i in enumerate(self.node_names):
+        for i, node_name_i in enumerate(node_names):
             node_i = self.name_node[node_name_i]
-            for j, node_name_j in enumerate(self.node_names[i + 1 :], start=i + 1):
+            for j, node_name_j in enumerate(node_names[i + 1 :], start=i + 1):
                 node_j = self.name_node[node_name_j]
                 pdist = node_i.distance(node_j)
-                self.tree_node_distance_matrix[i, j] = pdist
-                self.tree_node_distance_matrix[j, i] = pdist
-
-        # Log statistics for monitoring
-        logging.info(
-            f"Generated tree node distance matrix of shape {self.tree_node_distance_matrix.shape} "
-            f"for {n_nodes} nodes with max distance {self.tree_node_distance_matrix.max():.4f}"
-        )
+                tree_node_distance_matrix[i, j] = pdist
+                tree_node_distance_matrix[j, i] = pdist
+        return tree_node_distance_matrix
 
     def _load_placements(self) -> None:
         """
@@ -268,9 +271,10 @@ class Phylotypes:
         Processes placement data from JPLACE file and creates mappings
         between feature names (SVs) and their placement nodes.
 
-        Generates sv_nodes a dictionary
-            Key: sv_id (string)
-            Value: Dict
+        Generates
+        --------
+        sv_nodes : Dict[str, Dict[int, List[float]]]
+            Dictionary mapping feature names to placement nodes
         """
         self.sv_nodes = {}
 
@@ -289,25 +293,27 @@ class Phylotypes:
                     self.sv_nodes[sv] = pl_nodes
 
         # And list / vector based lookups of node *names*
-        self.node_names = sorted({
-            str(node_name)
-            for pl in self.sv_nodes.values()
-            for node_name in pl.keys()
-        })
+        self.node_names = sorted({str(node_name) for pl in self.sv_nodes.values() for node_name in pl.keys()})
         self.node_name_to_idx = {name: idx for idx, name in enumerate(self.node_names)}
-
 
         self._build_placement_tensors()
 
     def _build_placement_tensors(self) -> None:
-        """Build placement tensors
+        """
+        Build placement tensors.
+
+        Generates tensors for placement data including names, indices, LWR, and DL.
+
         Generates
-            placement_names[List]
-            placement_idx[Dict]: Name -> index in placement_names
-            placement_lwr tensor (float32) of shape (n_placements, num_nodes)
-                filled with LWR of nodes
-            placement_dl tensor (float32) of shape (n_placements, num_nodes)
-                filled with distal length of placement at nodes
+        --------
+        placement_names : List[str]
+            List of placement names
+        placement_idx : Dict[str, int]
+            Dictionary mapping placement names to their index
+        placement_lwr : torch.Tensor
+            Tensor of shape (n_placements, num_nodes) filled with LWR of nodes
+        placement_dl : torch.Tensor
+            Tensor of shape (n_placements, num_nodes) filled with distal length of placement at nodes
         """
 
         self.placement_names = sorted(self.sv_nodes.keys())
@@ -332,22 +338,35 @@ class Phylotypes:
                     dtype=torch.float32,
                 )
             )
-        
+
         self.placement_present = self.placement_lwr > 0
 
-
     def pairwise_emd(
-            self,
-            placement_indices: Optional[List[int]] = None,
-            distal_length: bool = True,
-        ) -> torch.Tensor:
+        self,
+        placement_indices: Optional[List[int]] = None,
+        distal_length: bool = True,
+    ) -> torch.Tensor:
         """
         Calculate the pairwise Earth Mover's Distance between all pairs of placements in a fully vectorized manner.
 
         Requires placement and tree node pairwise distance tensors to be generated and populated.
 
-        Generates:
-            torch.Tensor: A tensor of shape (n_placements, n_placements) containing the EMD values between all pairs of placements
+        Parameters
+        ----------
+        placement_indices : Optional[List[int]], optional
+            List of placement indices to calculate EMD for (default: None)
+        distal_length : bool, optional
+            Whether to include distal length in calculations (default: True)
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (n_placements, n_placements) containing the EMD values between all pairs of placements
+
+        Raises
+        ------
+        ValueError
+            If required placement tensors are not built
         """
         if not hasattr(self, "placement_lwr"):
             raise ValueError("Placement Tensor need to be built first")
@@ -356,30 +375,85 @@ class Phylotypes:
         if distal_length and not hasattr(self, "placement_dl"):
             raise ValueError("Placement distal length tensor need to be built")
 
+        # Subset based on provided indices if provided
+        if placement_indices is not None:
+            subset_placement_lwr = self.placement_lwr[placement_indices]
+            subset_dl = self.placement_dl[placement_indices]
+        else:
+            subset_placement_lwr = self.placement_lwr
+            subset_dl = self.placement_dl
+
+        # And the nodes we want to work with..
+        subset_node_idx_w_weight = subset_placement_lwr.amax(dim=0).nonzero().squeeze()
+        subset_placement_lwr = subset_placement_lwr[:, subset_node_idx_w_weight]
+        subset_dl = subset_dl[:, subset_node_idx_w_weight]
         # Implicit else we have needed attributes
         # Expand dimensions for broadcasting
-        P_a_i = self.placement_lwr.unsqueeze(1).unsqueeze(3)  # Shape ([n_placement, 1, n_nodes, 1])
-        P_b_j = self.placement_lwr.unsqueeze(0).unsqueeze(2)  # Shape ([1, n_placement, 1, n_nodes])
+
+        # Handle the edge case where all the weight for these placements is on *one* node
+        # i.e., the dim of subset_node_idx_w_weight is 0
+        if subset_node_idx_w_weight.dim() == 0:
+            logging.info(f"Calculating EMD for edge case of {len(placement_indices)} placements on one node.")  # type: ignore
+            # NO need to bother with flows. It's all here
+            if not distal_length:
+                # If there is no distal length, distance is zero
+                return torch.zeros(len(placement_indices), len(placement_indices), dtype=subset_placement_lwr.dtype)  # type: ignore
+            else:  # There *is* distal length
+                emd_matrix = subset_dl.unsqueeze(1) + subset_dl.unsqueeze(0)
+                torch.diagonal(emd_matrix).fill_(0.0)
+                return emd_matrix
+        logging.info(
+            f"Calculating flows for {subset_placement_lwr.shape[0]} placements over {subset_placement_lwr.shape[1]} nodes."
+        )
+        # Implicit else there are more than one nodes with placement...
+        P_a_i = subset_placement_lwr.unsqueeze(1).unsqueeze(3)  # Shape ([n_placement, 1, n_nodes, 1])
+        P_b_j = subset_placement_lwr.unsqueeze(0).unsqueeze(2)  # Shape ([1, n_placement, 1, n_nodes])
 
         flows = P_a_i * P_b_j  # Shape ([n_placement, n_placement, n_node, n_node])
 
+        logging.info("Building tree distance matrix")
+        tree_node_distance_matrix = self._get_tree_node_distance_matrix(list(subset_node_idx_w_weight))
+
         if distal_length:
             # distal_length_a_i shape: (n_placements, 1, n_nodes, 1)
-            distal_length_a_i = self.placement_dl.unsqueeze(1).unsqueeze(3)
+            distal_length_a_i = subset_dl.unsqueeze(1).unsqueeze(3)
             # distal_length_b_j shape: (1, n_placements, 1, n_nodes)
-            distal_length_b_j = self.placement_dl.unsqueeze(0).unsqueeze(2)
-            adjusted_tree_distances = self.tree_node_distance_matrix + distal_length_a_i + distal_length_b_j  # type: ignore[operator]
+            distal_length_b_j = subset_dl.unsqueeze(0).unsqueeze(2)
+            adjusted_tree_distances = tree_node_distance_matrix + distal_length_a_i + distal_length_b_j  # type: ignore[operator]
         else:
-            adjusted_tree_distances = self.tree_node_distance_matrix  # type: ignore[assignment]
+            adjusted_tree_distances = tree_node_distance_matrix  # type: ignore[assignment]
 
         weighted_dist = flows * adjusted_tree_distances  # Shape ([n_placement, n_placement, n_node, n_node])
 
+        logging.info("Calculating EMD (or KR) Distance")
         emd_matrix = torch.sum(weighted_dist, dim=(2, 3))  # shape ([n_placement, n_placement])
         torch.diagonal(emd_matrix).fill_(0.0)
 
         return emd_matrix
 
-    def _pregroup_by_lwr(self, pd_threshold: float, lwr_overlap: float) -> None:
+    def _get_lca_for_group(self, group: List[int]) -> TreeNode:
+        """
+        Get the lowest common ancestor for a group of placements.
+
+        Parameters
+        ----------
+        group : List
+            List of placement indices
+
+        Returns
+        -------
+        TreeNode
+            The lowest common ancestor TreeNode for the group
+        """
+        return self.tree.lowest_common_ancestor(  # type: ignore
+            {
+                self.name_node[self.node_names[nid.item()]]
+                for g_i in group
+                for nid in self.placement_present[g_i].nonzero().numpy().flatten()
+            }
+        )
+
+    def _pregroup_by_lwr(self) -> None:
         """
         Pre-group features by likelihood weight ratio overlap.
 
@@ -387,84 +461,77 @@ class Phylotypes:
         then clusters groups by phylogenetic distance to create
         preliminary feature groupings.
 
-        Args:
-            pd_threshold: Phylogenetic distance threshold for group clustering
-            lwr_overlap: Minimum LWR overlap threshold for inclusion
+        Notes
+        -----
+        Uses pd_threshold and lwr_overlap instance attributes for clustering parameters.
         """
+        # Our holder for groups
+        groups = []
         # Sort features by number of placements (ascending)
         sv_to_group = [
             v[0]
-            for v in 
-            sorted([
-                (sv, num_nodes)
-                for (sv, num_nodes) in zip(
-                    self.placement_names,
-                    self.placement_present.sum(dim=1).cpu().numpy()
-                )
-            ],
-            key=lambda v: v[1]
+            for v in sorted(
+                [
+                    (sv, num_nodes)
+                    for (sv, num_nodes) in zip(self.placement_names, self.placement_present.sum(dim=1).cpu().numpy())
+                ],
+                key=lambda v: v[1],
             )
         ]
 
-        sv_groups: List[List[str]] = []
-        logging.info("Grouping {} features".format(len(sv_to_group)))
-
-        # Group features by LWR overlap
+        logging.info("Grouping {} SV".format(len(sv_to_group)))
         while len(sv_to_group) > 0:
             seed_sv = sv_to_group.pop()
-            group_svs = {seed_sv}
-            group_node_ids = set(self.sv_nodes[seed_sv])
-
-            if len(sv_to_group) == 0:
-                sv_groups.append(list(group_svs))
-                continue
-
-            # Create overlap matrix for current group
-            empty_mat = [0] * (self.lwr_idx + 1)
-            g_overlap_mat = np.array(
-                [[self.sv_nodes[sv].get(n, empty_mat)[self.lwr_idx] for n in group_node_ids] for sv in sv_to_group]
+            seed_sv_idx = self.placement_idx[seed_sv]
+            group_svs_idx = {seed_sv_idx}
+            # Create a mask on the nodes axis where the seed has placement
+            seed_sv_mask = self.placement_present[seed_sv_idx]
+            # find sv with overlap probability with the seed above threshold
+            # And add to group_svs
+            group_svs_idx.update(
+                {
+                    idx.item()
+                    for idx in torch.nonzero(self.placement_lwr[:, seed_sv_mask].sum(dim=1) > self.lwr_overlap)
+                    if self.placement_names[idx] in sv_to_group
+                }
             )
-
-            # Filter features by overlap threshold
-            group_mask = LWR_Filter(g_overlap_mat, lwr_overlap)
-
-            # Add matching features to group
-            group_svs.update({sv for (sv, m) in zip(sv_to_group, group_mask.astype(bool)) if m})
-
-            # Remove grouped features from consideration
+            group_svs = {self.placement_names[i] for i in group_svs_idx}
+            # Remove these from the svs to be grouped
             sv_to_group = [sv for sv in sv_to_group if sv not in group_svs]
-            sv_groups.append(list(group_svs))
-
-            logging.debug(f"{len(sv_to_group)} SVs remain to pregroup, with {len(group_node_ids)} nodes at this step")
+            # And get rid of sv
+            groups.append(list(group_svs_idx))
 
         logging.info(
-            "Done pre-grouping features into {} groups, of which the largest is {} items".format(
-                len(sv_groups), max([len(svg) for svg in sv_groups])
+            "Done pre-grouping SV into {} groups, of which the largest is {} items".format(
+                len(groups), max([len(svg) for svg in groups])
             )
         )
 
-        # Calculate LCAs for each group
+        # Get the LCA for each group
         logging.info("Obtaining lowest common ancestor for each group")
-        sv_group_lca = [
-            self.tree.lowest_common_ancestor([self.name_node[nid] for sv in gsv for nid in self.sv_nodes[sv]])  # type: ignore[union-attr]
-            for gsv in sv_groups
-        ]
+        group_lca = [self._get_lca_for_group(grp) for grp in groups]
 
         # Calculate pairwise phylogenetic distances between groups
         logging.info("Calculating pairwise phylogenetic distance between groups")
-        g_lca_mat = np.zeros(shape=(len(sv_group_lca), len(sv_group_lca)), dtype=np.float64)
-
-        for i in range(len(sv_group_lca)):
-            for j in range(i + 1, len(sv_group_lca)):
-                ij_pd = sv_group_lca[i].distance(sv_group_lca[j])
+        g_lca_mat = np.zeros(shape=(len(group_lca), len(group_lca)), dtype=np.float64)
+        for i in range(len(group_lca)):
+            for j in range(i + 1, len(group_lca)):
+                ij_pd = group_lca[i].distance(group_lca[j])
                 g_lca_mat[i, j] = ij_pd
                 g_lca_mat[j, i] = ij_pd
+
+        # It is possible that these groups may be closer together
+        # then our desired lumping level. That can lead to SVs
+        # being inappropriately split into phylotypes.
+        # So we use the LCA and clustering to combine those pregroups together.
+        # From a computational perpective we are better off with *more* *smaller* clusters
+        # But alas...
 
         # Cluster groups by phylogenetic distance
         logging.info("Clustering groups by phylogenetic distance")
         g_lca_clusters = AgglomerativeClustering(
             n_clusters=None,
-            distance_threshold=pd_threshold,
+            distance_threshold=self.pd_threshold,
             metric="precomputed",
             linkage="average",
         ).fit_predict(g_lca_mat)
@@ -475,21 +542,20 @@ class Phylotypes:
         for old_cluster_idx, new_cluster_idx in enumerate(g_lca_clusters):
             new_old_sv_groups[new_cluster_idx].add(old_cluster_idx)
 
-        new_sv_groups = [
-            list(set([sv for idx in olds for sv in sv_groups[idx]])) for olds in new_old_sv_groups.values()
-        ]
+        new_sv_groups = [list(set([sv for idx in olds for sv in groups[idx]])) for olds in new_old_sv_groups.values()]
 
         logging.debug(
             "Now {} groups, with the largest {} items".format(
                 len(new_sv_groups), max([len(svg) for svg in new_sv_groups])
             )
         )
+        self._pregrouped_sv = new_sv_groups
+        self._pregroup_lca = [self._get_lca_for_group(grp) for grp in new_sv_groups]
 
-        self.sv_groups = new_sv_groups
-
-    def group_features(
-        self, lwr_overlap: float = 0.95, pd_threshold: float = 0.1, no_dl: bool = False
-    ) -> List[Set[str]]:
+    def generate_phylotypes(
+        self,
+        distal_length: bool = True,
+    ) -> None:
         """
         Group features into phylotypes based on phylogenetic distance.
 
@@ -497,109 +563,45 @@ class Phylotypes:
         phylogenetic distance within overlapping groups. Can optionally
         ignore distal length calculations.
 
-        Args:
-            lwr_overlap: Minimum likelihood weight ratio for initial grouping
-                        (default: 0.95)
-            pd_threshold: Phylogenetic distance threshold for final clustering
-                         (default: 0.1)
-            no_dl: If True, ignore distal length to nodes (default: False)
+        Parameters
+        ----------
+        distal_length : bool, optional
+            Whether to include distal length in calculations (default: True)
 
-        Returns:
+        Returns
+        -------
+        List[Set[str]]
             List of phylotype groups, each as a set of feature names
 
-        Note:
-            This method updates the instance's phylogroups attribute and
-            returns the complete list of phylotypes.
+        Notes
+        -----
+        This method updates the instance's phylogroups attribute and
+        returns the complete list of phylotypes.
         """
-        if no_dl:
-            logging.info("Ignoring distal length.")
-
-        self.lwr_overlap = lwr_overlap
-        self.pd_threshold = pd_threshold
+        if distal_length:
+            logging.info("Using Distal Length")
+        else:
+            logging.info("Ignoring distal length")
 
         logging.info("Pregrouping based on overlapping LWR for SV")
-        self._pregroup_by_lwr(pd_threshold, lwr_overlap)
+        self._pregroup_by_lwr()
 
         logging.info("Starting phylogrouping")
 
-        for g_i, g_sv in enumerate(self.sv_groups):
+        for g_i, g_sv in enumerate(self._pregrouped_sv):
             if (g_i + 1) % 100 == 0:
                 logging.debug("Group {} of {}".format(g_i, len(self.sv_groups)))
 
             if len(g_sv) == 1:
-                self.phylogroups.append(set(g_sv))
+                self.phylogroups.append(set([self.placement_names[g_sv[0]]]))
                 continue
-
+            # Implict else, this isn't a singleton group.
             # Calculate pairwise phylogenetic distances within group
-            g_sv_dist_mat = np.zeros(shape=(len(g_sv), len(g_sv)), dtype=np.float64)
-
-            for i in range(len(g_sv)):
-                sv1 = g_sv[i]
-
-                # Build placement profiles
-                if no_dl:
-                    sv1_p = {nid: (npl[self.lwr_idx], 0) for nid, npl in self.sv_nodes[sv1].items()}
-                else:
-                    sv1_p = {nid: (npl[self.lwr_idx], npl[self.dl_idx]) for nid, npl in self.sv_nodes[sv1].items()}  # type: ignore
-
-                sv1_lwr_total = sum((p[0] for p in sv1_p.values()))
-
-                for j in range(i + 1, len(g_sv)):
-                    sv2 = g_sv[j]
-
-                    # Build placement profiles for second feature
-                    if no_dl:
-                        sv2_p = {nid: (npl[self.lwr_idx], 0) for nid, npl in self.sv_nodes[sv2].items()}
-                    else:
-                        sv2_p = {nid: (npl[self.lwr_idx], npl[self.dl_idx]) for nid, npl in self.sv_nodes[sv2].items()}  # type: ignore
-
-                    sv2_lwr_total = sum((p[0] for p in sv2_p.values()))
-
-                    # Calculate phylogenetic distance
-                    paired_dist = 0.0
-
-                    # Overlapped nodes contribution
-                    overlap_nodes = set(sv1_p).intersection(set(sv2_p))
-                    paired_dist += sum(
-                        [
-                            sv1_p[n][1] * sv1_p[n][0] / sv1_lwr_total + sv2_p[n][1] * sv2_p[n][0] / sv2_lwr_total
-                            for n in overlap_nodes
-                        ]
-                    )
-
-                    # Distant nodes contribution
-                    distant_nodes = set(sv1_p).union(set(sv2_p)) - set(sv1_p).intersection(set(sv2_p))
-                    if len(distant_nodes) > 0:
-                        # Find LCA of distant nodes
-                        svp_lca = self.tree.lowest_common_ancestor([self.name_node.get(nid) for nid in distant_nodes])  # type: ignore[union-attr]
-
-                        # Add weighted distance to LCA
-                        paired_dist += (
-                            sum(
-                                [
-                                    (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
-                                    for nid, np in sv1_p.items()
-                                    if nid in distant_nodes
-                                ]
-                            )
-                            / sv1_lwr_total
-                            + sum(
-                                [
-                                    (np[1] + svp_lca.distance(self.name_node[nid])) * np[0]
-                                    for nid, np in sv2_p.items()
-                                    if nid in distant_nodes
-                                ]
-                            )
-                            / sv2_lwr_total
-                        )
-
-                    g_sv_dist_mat[i, j] = paired_dist
-                    g_sv_dist_mat[j, i] = paired_dist
-
+            g_sv_dist_mat = self.pairwise_emd(g_sv)
             # Cluster features by phylogenetic distance
             g_sv_clusters = AgglomerativeClustering(
                 n_clusters=None,
-                distance_threshold=pd_threshold,
+                distance_threshold=self.pd_threshold,
                 metric="precomputed",
                 linkage="average",
             ).fit_predict(g_sv_dist_mat)
@@ -610,9 +612,9 @@ class Phylotypes:
                 g_phylotype_svs[cl].add(sv)
 
             # Add clusters to phylogroups
-            self.phylogroups.extend(list(g_phylotype_svs.values()))
-
-        return self.phylogroups
+            self.phylogroups.extend(
+                [{self.placement_names[sv_i] for sv_i in phylotype_svs} for phylotype_svs in g_phylotype_svs.values()]
+            )
 
     def to_long(self) -> List[Tuple[str, str]]:
         """
@@ -621,7 +623,9 @@ class Phylotypes:
         Creates a list of (phylotype_id, feature_name) tuples sorted
         by phylotype size (largest first).
 
-        Returns:
+        Returns
+        -------
+        List[Tuple[str, str]]
             List of (phylotype_id, feature_name) tuples in long format
         """
         # Sort phylogroups by size (descending)
@@ -643,8 +647,10 @@ class Phylotypes:
         """
         Write phylogroups to CSV file in long format.
 
-        Args:
-            out_h: File handle for output CSV file (opened in text mode)
+        Parameters
+        ----------
+        out_h : TextIO
+            File handle for output CSV file (opened in text mode)
         """
         pg_long = self.to_long()
         writer = csv.writer(out_h)
@@ -652,6 +658,14 @@ class Phylotypes:
         writer.writerows(pg_long)
 
     def __repr__(self) -> str:
+        """
+        Return a string representation of the Phylotypes instance.
+
+        Returns
+        -------
+        str
+            String representation indicating if tree is loaded
+        """
         return f"Phylotype Generator. Tree loaded: {self.tree is not None}."
 
 
@@ -661,6 +675,11 @@ def main() -> None:
 
     Parses command-line arguments, loads JPLACE data, performs phylotype
     clustering, and outputs results to CSV file.
+
+    Notes
+    -----
+    This function handles the complete workflow from command line arguments
+    to final output generation.
     """
     args_parser = argparse.ArgumentParser(
         description="""Given a JPLACE file of placed features on a phylogenetic tree,
@@ -708,10 +727,12 @@ def main() -> None:
 
     args = args_parser.parse_args()
 
-    # Fixed class name bug: was Jplace, should be Phylotypes
-    phylotypes = Phylotypes()
+    phylotypes = Phylotypes(
+        lwr_overlap=args.lwr_overlap,
+        pd_threshold=args.threshold_pd,
+    )
     phylotypes.load_jplace(args.jplace)
-    phylotypes.group_features(args.lwr_overlap, args.threshold_pd, no_dl=args.no_distal_length)
+    phylotypes.generate_phylotypes()
 
     logging.info("Done Phylogrouping. Outputting.")
     phylotypes.to_csv(args.out)
