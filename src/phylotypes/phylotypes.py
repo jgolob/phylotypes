@@ -393,11 +393,13 @@ class Phylotypes:
         # Handle the edge case where all the weight for these placements is on *one* node
         # i.e., the dim of subset_node_idx_w_weight is 0
         if subset_node_idx_w_weight.dim() == 0:
-            logging.info(f"Calculating EMD for edge case of {len(placement_indices)} placements on one node.")  # type: ignore
+            logging.info(f"Calculating EMD for edge case of {subset_placement_lwr.shape[0]} placements on one node.")
             # NO need to bother with flows. It's all here
             if not distal_length:
                 # If there is no distal length, distance is zero
-                return torch.zeros(len(placement_indices), len(placement_indices), dtype=subset_placement_lwr.dtype)  # type: ignore
+                return torch.zeros(
+                    subset_placement_lwr.shape[0], subset_placement_lwr.shape[0], dtype=subset_placement_lwr.dtype
+                )
             else:  # There *is* distal length
                 emd_matrix = subset_dl.unsqueeze(1) + subset_dl.unsqueeze(0)
                 torch.diagonal(emd_matrix).fill_(0.0)
