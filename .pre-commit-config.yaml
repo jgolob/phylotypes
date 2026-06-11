@@ -1,4 +1,4 @@
-# Pre-commit configuration for mypy and ruff with Google style Python defaults
+# Pre-commit configuration for ty and ruff with Google style Python defaults
 # Install with: pre-commit install
 # Run on all files with: pre-commit run --all-files
 
@@ -20,28 +20,28 @@ repos:
       - id: debug-statements
       - id: check-docstring-first
 
-  # Ruff linting and formatting (Google style) - using Poetry
+  # Ruff linting and formatting (Google style) - using uv
   - repo: local
     hooks:
       - id: ruff-format
         name: ruff-format
-        entry: poetry run ruff format
+        entry: uv run ruff format
+        language: system
+        types: [python]
+      - id: ruff-check
+        name: ruff-check
+        entry: uv run ruff check --fix
         language: system
         types: [python]
 
-  # MyPy type checking (Google style) - using Poetry
+  # ty type checking - using uv
   - repo: local
     hooks:
-      - id: mypy
-        name: mypy
-        entry: poetry run mypy
+      - id: ty
+        name: ty
+        entry: uv run ty check
         language: system
         types: [python]
-        args: [
-          "--ignore-missing-imports",
-          "--show-error-codes",
-          "--strict",
-        ]
         files: "^src/"
 
 # Configuration settings

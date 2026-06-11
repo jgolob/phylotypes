@@ -43,7 +43,7 @@ phylotype_taxonomy = "phylotypes.phylotype_taxonomy:main"
 packages = [{include = "phylotypes", from = "src"}]
 [dependency-groups]
 dev = [
-    "mypy (>=1.18.2,<2.0.0)",
+    "ty (>=0.0.1a1)",
     "ruff (>=0.14.3,<0.15.0)",
     "pre-commit (>=4.3.0,<5.0.0)",
     "ipykernel (==6.31.0)",
@@ -124,31 +124,9 @@ convention = "google"
 known-first-party = ["phylotypes"]
 force-sort-within-sections = true
 
-# MyPy type checking configuration (Google style)
-[tool.mypy]
-python_version = "3.10"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-disallow_untyped_decorators = true
-no_implicit_optional = true
-warn_redundant_casts = true
-warn_unused_ignores = true
-warn_no_return = true
-warn_unreachable = true
-strict_equality = true
-
-[[tool.mypy.overrides]]
-module = [
-    "biopython.*",
-    "skbio.*",
-    "sklearn.*",
-    "torch.*",
-    "pandas.*",
-]
-ignore_missing_imports = true
+# ty type checking configuration
+[tool.ty.environment]
+python-version = "3.10"
 
 # Pre-commit hooks are configured in .pre-commit-config.yaml
 # Install pre-commit hooks with: pre-commit install
