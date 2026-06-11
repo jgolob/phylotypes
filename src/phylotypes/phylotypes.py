@@ -95,7 +95,13 @@ class Phylotypes:
 
     required_fields = ["fields", "placements", "tree"]
 
-    def __init__(self, lwr_overlap: float = 0.1, pd_threshold: float = 1.0, distance: str = "legacy") -> None:
+    def __init__(
+        self,
+        lwr_overlap: float = 0.1,
+        pd_threshold: float = 1.0,
+        distance: str = "legacy",
+        device: str = "cpu",
+    ) -> None:
         """
         Initialize Phylotypes instance with clustering parameters.
 
@@ -109,6 +115,8 @@ class Phylotypes:
             Pairwise distance metric to use: "legacy" (default; exact vectorized
             reimplementation of the original metric, reproduces prior phylotypes) or
             "kr" (true tree-Wasserstein / Kantorovich-Rubinstein distance, opt-in)
+        device : str, optional
+            torch device to use for tensor computations, e.g. "cpu" or "cuda" (default: "cpu")
         """
         if distance not in ("legacy", "kr"):
             msg = f"Unknown distance metric: {distance!r}. Must be 'legacy' or 'kr'."
@@ -118,6 +126,7 @@ class Phylotypes:
         self.lwr_overlap: float = lwr_overlap
         self.pd_threshold: float = pd_threshold
         self.distance: str = distance
+        self.device: torch.device = torch.device(device)
 
         # Data containers
         self.phylogroups: List[Set[str]] = []
@@ -295,8 +304,8 @@ class Phylotypes:
         self.placement_idx = {n: i for i, n in enumerate(self.placement_names)}
         n_placements = len(self.placement_names)
         n_nodes = len(self.node_names)
-        self.placement_lwr = torch.zeros((n_placements, n_nodes), dtype=torch.float32)
-        self.placement_dl = torch.zeros((n_placements, n_nodes), dtype=torch.float32)
+        self.placement_lwr = torch.zeros((n_placements, n_nodes), dtype=torch.float32, device=self.device)
+        self.placement_dl = torch.zeros((n_placements, n_nodes), dtype=torch.float32, device=self.device)
 
         for placement_name, placement in self.sv_nodes.items():
             placement_i = self.placement_idx[placement_name]
@@ -305,12 +314,14 @@ class Phylotypes:
                 torch.tensor(
                     [placement[node][self.lwr_idx] for node in placement_nodes],
                     dtype=torch.float32,
+                    device=self.device,
                 )
             )
             self.placement_dl[placement_i, [self.node_name_to_idx[str(node)] for node in placement_nodes]] = (
                 torch.tensor(
                     [placement[node][self.dl_idx] for node in placement_nodes],
                     dtype=torch.float32,
+                    device=self.device,
                 )
             )
 
@@ -336,7 +347,7 @@ class Phylotypes:
         self.node_depth: Dict[int, float] = {}
 
         if self.tree is None:
-            self.node_depth_tensor = torch.zeros(len(self.node_names), dtype=torch.float32)
+            self.node_depth_tensor = torch.zeros(len(self.node_names), dtype=torch.float32, device=self.device)
             self._lca_depth_cache = {}
             return
 
@@ -352,6 +363,7 @@ class Phylotypes:
         self.node_depth_tensor = torch.tensor(
             [self.node_depth[id(self.name_node[name])] for name in self.node_names],
             dtype=torch.float32,
+            device=self.device,
         )
         self._lca_depth_cache = {}
 
@@ -404,7 +416,7 @@ class Phylotypes:
             the (1 - overlap) fractions in the caller regardless.
         """
         n = present.shape[0]
-        out = torch.zeros((n, n), dtype=torch.float32)
+        out = torch.zeros((n, n), dtype=torch.float32, device=self.device)
         for a in range(n):
             for b in range(a + 1, n):
                 distant = (present[a] ^ present[b]).nonzero(as_tuple=True)[0]
@@ -947,12 +959,19 @@ def main() -> None:
         default="legacy",
     )
 
+    args_parser.add_argument(
+        "--device",
+        help="torch device for tensor computations, e.g. 'cpu' or 'cuda'. (Default: cpu).",
+        default="cpu",
+    )
+
     args = args_parser.parse_args()
 
     phylotypes = Phylotypes(
         lwr_overlap=args.lwr_overlap,
         pd_threshold=args.threshold_pd,
         distance=args.distance,
+        device=args.device,
     )
     try:
         phylotypes.load_jplace(args.jplace)
