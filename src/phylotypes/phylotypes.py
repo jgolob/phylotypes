@@ -950,16 +950,18 @@ def main() -> None:
     args_parser.add_argument(
         "--lwr-overlap",
         "-L",
-        help="minimum like-weight ratio for grouping of features. (Default: 0.01).",
-        default=0.01,
+        help="minimum like-weight ratio for grouping of features. (Default: 0.1).",
+        default=0.1,
         type=float,
     )
 
     args_parser.add_argument(
         "--threshold_pd",
         "-T",
-        help="Phylogenetic distance threshold for clustering. (Default: 1.0)",
-        default=0.1,
+        help="Phylogenetic distance threshold for clustering. (Default: 1.0). Calibrated for "
+        "--distance legacy; if using --distance kr, re-calibrate this on your data -- the "
+        "legacy default will over- or under-split.",
+        default=1.0,
         type=float,
     )
 
@@ -974,7 +976,9 @@ def main() -> None:
         "--distance",
         "-D",
         help="Pairwise distance metric: 'legacy' (default; reproduces prior phylotypes) or "
-        "'kr' (true tree-Wasserstein distance, opt-in). (Default: legacy)",
+        "'kr' (true tree-Wasserstein distance, opt-in). (Default: legacy). Note: "
+        "--threshold_pd defaults are calibrated for 'legacy'; 'kr' is a different "
+        "(smaller-valued) scale and needs its own threshold, re-calibrated on your data.",
         choices=["legacy", "kr"],
         default="legacy",
     )
