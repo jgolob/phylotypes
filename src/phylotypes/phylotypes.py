@@ -12,6 +12,7 @@ License: MIT
 
 import argparse
 import csv
+import itertools
 import json
 import logging
 import re
@@ -95,7 +96,7 @@ class Phylotypes:
 
     required_fields = ["fields", "placements", "tree"]
 
-    def __init__(self, lwr_overlap: float = 0.1, pd_threshold: float = 1.0) -> None:
+    def __init__(self, lwr_overlap: float = 0.1, pd_threshold: float = 1.0, distance: str = "legacy") -> None:
         """
         Initialize Phylotypes instance with clustering parameters.
 
@@ -105,10 +106,19 @@ class Phylotypes:
             Minimum likelihood weight ratio overlap for initial grouping (default: 0.1)
         pd_threshold : float, optional
             Phylogenetic distance threshold for final clustering (default: 1.0)
+        distance : str, optional
+            Pairwise distance metric to use: "legacy" (default; exact vectorized
+            reimplementation of the original metric, reproduces prior phylotypes) or
+            "kr" (true tree-Wasserstein / Kantorovich-Rubinstein distance, opt-in)
         """
+        if distance not in ("legacy", "kr"):
+            msg = f"Unknown distance metric: {distance!r}. Must be 'legacy' or 'kr'."
+            raise ValueError(msg)
+
         # Clustering parameters
         self.lwr_overlap: float = lwr_overlap
         self.pd_threshold: float = pd_threshold
+        self.distance: str = distance
 
         # Data containers
         self.phylogroups: List[Set[str]] = []
@@ -176,10 +186,10 @@ class Phylotypes:
             logging.error(f"Missing required field: {e}. Required: edge_num, like_weight_ratio, distal_length")
             return
 
-        logging.info("Loading and caching placements")
-        self._load_placements()
         logging.info("Loading tree")
         self._load_tree()
+        logging.info("Loading and caching placements")
+        self._load_placements()
 
     def _load_tree(self) -> None:
         """
@@ -297,6 +307,7 @@ class Phylotypes:
         self.node_name_to_idx = {name: idx for idx, name in enumerate(self.node_names)}
 
         self._build_placement_tensors()
+        self._build_tree_geometry()
 
     def _build_placement_tensors(self) -> None:
         """
@@ -341,114 +352,329 @@ class Phylotypes:
 
         self.placement_present = self.placement_lwr > 0
 
-    def pairwise_emd(
+    def _build_tree_geometry(self) -> None:
+        """
+        Precompute reusable tree geometry for the distance metrics.
+
+        Generates
+        --------
+        node_depth : Dict[int, float]
+            Maps `id(TreeNode)` to that node's distance from the tree root, computed
+            once via a single top-down traversal.
+        node_depth_tensor : torch.Tensor
+            Tensor of shape (n_nodes,) aligning `node_depth` to the placement
+            tensors' node columns (the order of `self.node_names`).
+        _lca_depth_cache : Dict[Tuple[int, ...], float]
+            Memoization cache mapping a (sorted) tuple of node-column indices to the
+            depth of their lowest common ancestor. Shared across pairwise-distance
+            calls and pregroups.
+        """
+        self.node_depth: Dict[int, float] = {}
+
+        if self.tree is None:
+            self.node_depth_tensor = torch.zeros(len(self.node_names), dtype=torch.float32)
+            self._lca_depth_cache = {}
+            return
+
+        self.node_depth[id(self.tree)] = 0.0
+        stack = [self.tree]
+        while stack:
+            node = stack.pop()
+            depth = self.node_depth[id(node)]
+            for child in node.children:
+                self.node_depth[id(child)] = depth + (child.length or 0.0)
+                stack.append(child)
+
+        self.node_depth_tensor = torch.tensor(
+            [self.node_depth[id(self.name_node[name])] for name in self.node_names],
+            dtype=torch.float32,
+        )
+        self._lca_depth_cache = {}
+
+    def _lca_depth_for_nodes(self, node_idx: Tuple[int, ...]) -> float:
+        """
+        Depth of the lowest common ancestor of a set of node-column indices.
+
+        Results are memoized in `_lca_depth_cache` since the same node sets recur
+        across many placement pairs and pregroups.
+
+        Parameters
+        ----------
+        node_idx : Tuple[int, ...]
+            Sorted tuple of indices into `self.node_names`.
+
+        Returns
+        -------
+        float
+            Distance from the tree root to the lowest common ancestor of the nodes.
+        """
+        cached = self._lca_depth_cache.get(node_idx)
+        if cached is not None:
+            return cached
+        if self.tree is None:
+            msg = "Tree must be loaded"
+            raise ValueError(msg)
+
+        nodes = [self.name_node[self.node_names[i]] for i in node_idx]
+        lca = nodes[0] if len(nodes) == 1 else self.tree.lowest_common_ancestor(nodes)
+        depth = self.node_depth[id(lca)]
+        self._lca_depth_cache[node_idx] = depth
+        return depth
+
+    def _lca_depth_matrix(self, present: torch.Tensor) -> torch.Tensor:
+        """
+        Depth of the LCA of the symmetric-difference node set for each pair of placements.
+
+        Parameters
+        ----------
+        present : torch.Tensor
+            Boolean tensor of shape (n, n_nodes); `present[i]` is the set of node
+            columns on which placement `i` has any weight.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape (n, n) where entry [a, b] is the depth of the LCA of the
+            nodes where placements `a` and `b` disagree (their symmetric difference).
+            Pairs with identical support get 0 -- their contribution is zeroed out by
+            the (1 - overlap) fractions in the caller regardless.
+        """
+        n = present.shape[0]
+        out = torch.zeros((n, n), dtype=torch.float32)
+        for a in range(n):
+            for b in range(a + 1, n):
+                distant = (present[a] ^ present[b]).nonzero(as_tuple=True)[0]
+                if distant.numel() == 0:
+                    continue
+                depth = self._lca_depth_for_nodes(tuple(sorted(distant.tolist())))
+                out[a, b] = depth
+                out[b, a] = depth
+        return out
+
+    def pairwise_distance(
         self,
         placement_indices: Optional[List[int]] = None,
         distal_length: bool = True,
-        batch_size: int = 10,
+        metric: Optional[str] = None,
     ) -> torch.Tensor:
         """
-        Calculate the pairwise Earth Mover's Distance between all pairs of placements in a fully vectorized manner.
+        Calculate the pairwise phylogenetic distance between placements.
 
-        Requires placement and tree node pairwise distance tensors to be generated and populated.
+        Dispatches to `_pairwise_legacy` (the default, exact vectorized
+        reimplementation of the original metric) or `_pairwise_kr` (the true
+        tree-Wasserstein / Kantorovich-Rubinstein distance, opt-in).
 
         Parameters
         ----------
         placement_indices : Optional[List[int]], optional
-            List of placement indices to calculate EMD for (default: None)
+            List of placement indices to calculate distances for (default: all)
+        distal_length : bool, optional
+            Whether to include distal length in calculations (default: True)
+        metric : Optional[str], optional
+            Override `self.distance` for this call ("legacy" or "kr")
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (n, n) containing the pairwise distances
+
+        Raises
+        ------
+        ValueError
+            If `metric` (or `self.distance`) is not "legacy" or "kr"
+        """
+        metric = metric or self.distance
+        if metric == "kr":
+            return self._pairwise_kr(placement_indices, distal_length)
+        if metric == "legacy":
+            return self._pairwise_legacy(placement_indices, distal_length)
+        msg = f"Unknown distance metric: {metric!r}"
+        raise ValueError(msg)
+
+    def _pairwise_legacy(
+        self,
+        placement_indices: Optional[List[int]] = None,
+        distal_length: bool = True,
+    ) -> torch.Tensor:
+        """
+        Exact vectorized reimplementation of the original LCA-weighted-average distance.
+
+        For a pair of placements (a, b), this reproduces
+        `add_phylotypes.placement_pairwise_distance` to float precision:
+
+            legacy(a, b) = s_a + s_b
+                         + (DepAll_a - DepOv_ab) + (DepAll_b - DepOv_ba)
+                         - depth(L_ab) * (fracA_ab + fracB_ab)
+
+        where `p` is the row-normalized LWR, `Ind = (placement_lwr > 0)`, `depth` is
+        each node's distance from the tree root, `dl` is the distal length, and
+        `L_ab` is the lowest common ancestor of the symmetric-difference node set for
+        the pair (its only genuinely pairwise term).
+
+        Parameters
+        ----------
+        placement_indices : Optional[List[int]], optional
+            List of placement indices to calculate distances for (default: all)
         distal_length : bool, optional
             Whether to include distal length in calculations (default: True)
 
         Returns
         -------
         torch.Tensor
-            A tensor of shape (n_placements, n_placements) containing the EMD values between all pairs of placements
+            A tensor of shape (n, n) containing the pairwise distances
 
         Raises
         ------
         ValueError
-            If required placement tensors are not built
+            If required placement tensors or the tree are not built/loaded
         """
         if not hasattr(self, "placement_lwr"):
-            raise ValueError("Placement Tensor need to be built first")
-        if not hasattr(self, "placement_present"):
-            raise ValueError("Placement present tensor must be build")
+            msg = "Placement tensor must be built first"
+            raise ValueError(msg)
         if distal_length and not hasattr(self, "placement_dl"):
-            raise ValueError("Placement distal length tensor need to be built")
-            # Implicit else we have needed attributes
+            msg = "Placement distal length tensor must be built"
+            raise ValueError(msg)
+        if self.tree is None:
+            msg = "Tree must be loaded"
+            raise ValueError(msg)
 
-        # Subset based on provided indices if provided
-        if placement_indices is not None:
-            subset_placement_lwr = self.placement_lwr[placement_indices]
-            subset_dl = self.placement_dl[placement_indices]
-        else:
-            subset_placement_lwr = self.placement_lwr
-            subset_dl = self.placement_dl
+        idx = list(range(self.placement_lwr.shape[0])) if placement_indices is None else list(placement_indices)
+        dtype = self.placement_lwr.dtype
+        device = self.placement_lwr.device
+        n = len(idx)
+        if n <= 1:
+            return torch.zeros((n, n), dtype=dtype, device=device)
 
-        # And the nodes we want to work with..
-        subset_node_idx_w_weight = subset_placement_lwr.amax(dim=0).nonzero().squeeze()
-        subset_placement_lwr = subset_placement_lwr[:, subset_node_idx_w_weight]
-        subset_dl = subset_dl[:, subset_node_idx_w_weight]
+        lwr = self.placement_lwr[idx].to(dtype)
+        ind = self.placement_present[idx].to(dtype)
+        row_sum = lwr.sum(dim=1, keepdim=True).clamp_min(torch.finfo(dtype).eps)
+        p = lwr / row_sum
+        dl = self.placement_dl[idx].to(dtype) if distal_length else torch.zeros_like(lwr)
+        depth = self.node_depth_tensor.to(dtype=dtype, device=device)
 
-        # Handle the edge case where all the weight for these placements is on *one* node
-        # i.e., the dim of subset_node_idx_w_weight is 0
-        if subset_node_idx_w_weight.dim() == 0:
-            logging.info(f"Calculating EMD for edge case of {subset_placement_lwr.shape[0]} placements on one node.")
-            # NO need to bother with flows. It's all here
-            if not distal_length:
-                # If there is no distal length, distance is zero
-                return torch.zeros(
-                    subset_placement_lwr.shape[0], subset_placement_lwr.shape[0], dtype=subset_placement_lwr.dtype
-                )
-            else:  # There *is* distal length
-                emd_matrix = subset_dl.unsqueeze(1) + subset_dl.unsqueeze(0)
-                torch.diagonal(emd_matrix).fill_(0.0)
-                return emd_matrix
+        s = (dl * p).sum(dim=1)
+        dep_all = (depth.unsqueeze(0) * p).sum(dim=1)
+        wov = p @ ind.T
+        dep_ov = (p * depth.unsqueeze(0)) @ ind.T
 
-        logging.info(f"Building tree distance matrix {subset_node_idx_w_weight.shape[0]} nodes.")
-        tree_node_distance_matrix = self._get_tree_node_distance_matrix(list(subset_node_idx_w_weight))
+        frac_a = 1.0 - wov
+        frac_b = 1.0 - wov.T
+        lca_depth = self._lca_depth_matrix(self.placement_present[idx]).to(dtype=dtype, device=device)
 
-        n_placements = subset_placement_lwr.shape[0]
-        emd_matrix = torch.zeros((n_placements, n_placements), dtype=torch.float32)
-        # Expand dimensions for broadcasting
-        logging.info(
-            f"Calculating flows for {subset_placement_lwr.shape[0]} placements over {subset_placement_lwr.shape[1]} nodes."
+        result = (
+            s.unsqueeze(1)
+            + s.unsqueeze(0)
+            + (dep_all.unsqueeze(1) - dep_ov)
+            + (dep_all.unsqueeze(0) - dep_ov.T)
+            - lca_depth * (frac_a + frac_b)
         )
+        torch.diagonal(result).fill_(0.0)
+        return result
 
-        for i in range(0, n_placements, batch_size):
-            for j in range(0, n_placements, batch_size):
-                # Extract batches
-                batch_i = subset_placement_lwr[i : i + batch_size]
-                batch_j = subset_placement_lwr[j : j + batch_size]
-                # And limit to notes in this batch
-                batch_nodes_idx = torch.vstack([batch_i, batch_j]).amax(dim=0).nonzero().squeeze()
-                # And then limit again!
-                batch_i = batch_i[:, batch_nodes_idx]
-                batch_j = batch_j[:, batch_nodes_idx]
-                # Compute flows for the batch
-                P_a_i = batch_i.unsqueeze(1).unsqueeze(3)  # Shape: [batch_i, 1, n_nodes, 1]
-                P_b_j = batch_j.unsqueeze(0).unsqueeze(2)  # Shape: [1, batch_j, 1, n_nodes]
-                flows = P_a_i * P_b_j  # Shape: [batch_i, batch_j, n_nodes, n_nodes]
-                # Compute adjusted tree distances
-                if distal_length:
-                    distal_length_a_i = subset_dl[i : i + batch_size, batch_nodes_idx].unsqueeze(1).unsqueeze(3)
-                    distal_length_b_j = subset_dl[j : j + batch_size, batch_nodes_idx].unsqueeze(0).unsqueeze(2)
-                    adjusted_tree_distances = (
-                        tree_node_distance_matrix[batch_nodes_idx, batch_nodes_idx]  # type: ignore
-                        + distal_length_a_i
-                        + distal_length_b_j
-                    )
-                else:
-                    adjusted_tree_distances = tree_node_distance_matrix[batch_nodes_idx, batch_nodes_idx]  # type: ignore
-                # Compute weighted distances and sum
-                weighted_dist = flows * adjusted_tree_distances
-                emd_batch = torch.sum(weighted_dist, dim=(2, 3))  # Shape: [batch_i, batch_j]
-                # Update the EMD matrix
-                emd_matrix[i : i + batch_size, j : j + batch_size] = emd_batch
+    def _pairwise_kr(
+        self,
+        placement_indices: Optional[List[int]] = None,
+        distal_length: bool = True,
+        batch_size: int = 64,
+    ) -> torch.Tensor:
+        """
+        Exact pairwise tree-Wasserstein (Kantorovich-Rubinstein) distance.
 
-        torch.diagonal(emd_matrix).fill_(0.0)
+        Each placement is a probability measure on the tree (LWR normalised to sum 1,
+        mass on edge e sitting `distal_length` from e's distal node). KR = integral
+        |F_a - F_b| over the tree, which is an L1 distance in the embedding
+        phi_p[seg] = len(seg) * F_p(seg) over tree segments on which every F_p is
+        constant. A true metric: symmetric, zero-diagonal, valid for precomputed
+        clustering.
 
-        return emd_matrix
+        Parameters
+        ----------
+        placement_indices : Optional[List[int]], optional
+            List of placement indices to calculate distances for (default: all)
+        distal_length : bool, optional
+            Whether to include distal length in calculations (default: True)
+        batch_size : int, optional
+            Row-batch size for the final pairwise L1 computation (default: 64)
+
+        Returns
+        -------
+        torch.Tensor
+            A tensor of shape (n, n) containing the pairwise tree-Wasserstein distances
+
+        Raises
+        ------
+        ValueError
+            If required placement tensors or the tree are not built/loaded
+        """
+        if not hasattr(self, "placement_lwr"):
+            msg = "Placement tensor must be built first"
+            raise ValueError(msg)
+        if distal_length and not hasattr(self, "placement_dl"):
+            msg = "Placement distal length tensor must be built"
+            raise ValueError(msg)
+        if self.tree is None:
+            msg = "Tree must be loaded"
+            raise ValueError(msg)
+
+        idx = list(range(self.placement_lwr.shape[0])) if placement_indices is None else list(placement_indices)
+        dtype = self.placement_lwr.dtype
+        device = self.placement_lwr.device
+        n = len(idx)
+        if n <= 1:
+            return torch.zeros((n, n), dtype=dtype, device=device)
+
+        a = self.placement_lwr[idx].to(dtype).clone()
+        row_sum = a.sum(dim=1, keepdim=True)
+        if bool((row_sum.squeeze(1) <= 0).any()):
+            logging.warning(
+                "%d placement(s) have zero total LWR; KR is undefined for them.",
+                int((row_sum.squeeze(1) <= 0).sum()),
+            )
+        a = a / row_sum.clamp_min(torch.finfo(dtype).eps)
+
+        dl = self.placement_dl[idx].to(dtype)
+        zero_vec = torch.zeros(n, dtype=dtype, device=device)
+
+        incl: Dict[int, torch.Tensor] = {}
+        phi_cols: List[torch.Tensor] = []
+        for node in self.tree.postorder(include_self=True):
+            col = self.node_name_to_idx.get(node.name)
+            own = a[:, col] if col is not None else zero_vec
+            below = zero_vec
+            for child in node.children:
+                below = below + incl.pop(id(child))
+            incl[id(node)] = own + below
+            length = node.length
+            if node.is_root() or not length or length <= 0:
+                continue
+            length = float(length)
+            if col is None or not bool((own > 0).any()):
+                phi_cols.append(below * length)
+                continue
+            if not distal_length:
+                phi_cols.append((below + own) * length)
+                continue
+            offsets = dl[:, col].clamp(0.0, length)
+            on = own > 0
+            cuts = sorted({0.0, length} | {float(o) for o in offsets[on].tolist() if 0.0 < o < length})
+            for lo, hi in itertools.pairwise(cuts):
+                seg_len = hi - lo
+                if seg_len <= 0:
+                    continue
+                included = own * (offsets <= lo).to(dtype)
+                phi_cols.append((below + included) * seg_len)
+
+        if not phi_cols:
+            return torch.zeros((n, n), dtype=dtype, device=device)
+        phi = torch.stack(phi_cols, dim=1)
+        keep = (phi.amax(dim=0) - phi.amin(dim=0)) > 0
+        phi = phi[:, keep]
+        emd = torch.zeros((n, n), dtype=dtype, device=device)
+        for s in range(0, n, batch_size):
+            emd[s : s + batch_size] = (phi[s : s + batch_size].unsqueeze(1) - phi.unsqueeze(0)).abs().sum(dim=2)
+        emd.clamp_min_(0.0)
+        torch.diagonal(emd).fill_(0.0)
+        return emd
 
     def _get_lca_for_group(self, group: List[int]) -> TreeNode:
         """
@@ -616,7 +842,7 @@ class Phylotypes:
                 continue
             # Implict else, this isn't a singleton group.
             # Calculate pairwise phylogenetic distances within group
-            g_sv_dist_mat = self.pairwise_emd(g_sv)
+            g_sv_dist_mat = self.pairwise_distance(g_sv)
             # Cluster features by phylogenetic distance
             g_sv_clusters = AgglomerativeClustering(
                 n_clusters=None,
@@ -744,11 +970,21 @@ def main() -> None:
         action="store_true",
     )
 
+    args_parser.add_argument(
+        "--distance",
+        "-D",
+        help="Pairwise distance metric: 'legacy' (default; reproduces prior phylotypes) or "
+        "'kr' (true tree-Wasserstein distance, opt-in). (Default: legacy)",
+        choices=["legacy", "kr"],
+        default="legacy",
+    )
+
     args = args_parser.parse_args()
 
     phylotypes = Phylotypes(
         lwr_overlap=args.lwr_overlap,
         pd_threshold=args.threshold_pd,
+        distance=args.distance,
     )
     phylotypes.load_jplace(args.jplace)
     phylotypes.generate_phylotypes()
