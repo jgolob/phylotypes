@@ -842,7 +842,7 @@ class Phylotypes:
 
         for g_i, g_sv in enumerate(self._pregrouped_sv):
             if (g_i + 1) % 100 == 0:
-                logging.debug("Group {} of {}".format(g_i, len(self.sv_groups)))
+                logging.debug("Group %d of %d", g_i, len(self._pregrouped_sv))
 
             if len(g_sv) == 1:
                 self.phylogroups.append(set([self.placement_names[g_sv[0]]]))
