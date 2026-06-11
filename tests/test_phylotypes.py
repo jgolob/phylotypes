@@ -1,7 +1,10 @@
 """Distance-metric and end-to-end tests for the Phylotypes pipeline."""
 
+import io
+import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from phylotypes.phylotypes import Phylotypes
@@ -92,3 +95,11 @@ def test_generate_phylotypes_partitions_all_svs():
         p.generate_phylotypes()
         grouped = {sv for grp in p.phylogroups for sv in grp}
         assert grouped == {"sv1", "sv2", "sv3", "sv4"}, metric
+
+
+def test_missing_tree_raises():
+    p = Phylotypes()
+    bad = io.StringIO(json.dumps({"fields": ["edge_num", "like_weight_ratio",
+                                              "distal_length"], "placements": []}))
+    with pytest.raises(ValueError):
+        p.load_jplace(bad)

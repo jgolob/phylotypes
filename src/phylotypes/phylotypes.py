@@ -16,6 +16,7 @@ import itertools
 import json
 import logging
 import re
+import sys
 from collections import defaultdict
 from io import StringIO
 from typing import (
@@ -161,21 +162,27 @@ class Phylotypes:
         - 'fields': Column headers for placement data
         - 'placements': List of feature placements
         - 'tree': Newick-formatted phylogenetic tree
+
+        Raises
+        ------
+        ValueError
+            If the JPLACE file cannot be parsed, is missing required fields,
+            or contains a tree that cannot be parsed.
         """
         logging.info("Loading jplace file")
 
         try:
             self.jplace = json.load(jplace_fh)
         except (json.JSONDecodeError, AttributeError) as e:
-            logging.error(f"Failed to parse JPLACE file: {e}")
-            return
+            msg = f"Failed to parse JPLACE file: {e}"
+            raise ValueError(msg) from e
 
         # Validate required fields
 
         for field in self.required_fields:
             if field not in self.jplace:
-                logging.error(f"Missing required '{field}' entry in jplace. Exiting")
-                return
+                msg = f"Missing required '{field}' entry in jplace."
+                raise ValueError(msg)
 
         logging.info("Indexing fields")
         try:
@@ -183,8 +190,8 @@ class Phylotypes:
             self.lwr_idx = self.jplace["fields"].index("like_weight_ratio")
             self.dl_idx = self.jplace["fields"].index("distal_length")
         except ValueError as e:
-            logging.error(f"Missing required field: {e}. Required: edge_num, like_weight_ratio, distal_length")
-            return
+            msg = f"Missing required field: {e}. Required: edge_num, like_weight_ratio, distal_length"
+            raise ValueError(msg) from e
 
         logging.info("Loading tree")
         self._load_tree()
@@ -224,8 +231,8 @@ class Phylotypes:
                 th.seek(0)
                 self.tree = TreeNode.read(th)
         except Exception as e:
-            logging.error(f"Failed to parse phylogenetic tree: {e}")
-            return
+            msg = f"Failed to parse phylogenetic tree: {e}"
+            raise ValueError(msg) from e
 
         # Cleanup node names...
         for node in self.tree.traverse():
@@ -990,7 +997,11 @@ def main() -> None:
         pd_threshold=args.threshold_pd,
         distance=args.distance,
     )
-    phylotypes.load_jplace(args.jplace)
+    try:
+        phylotypes.load_jplace(args.jplace)
+    except ValueError as e:
+        logging.error(e)
+        sys.exit(1)
     phylotypes.generate_phylotypes()
 
     logging.info("Done Phylogrouping. Outputting.")
