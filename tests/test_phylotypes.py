@@ -1,6 +1,7 @@
 """Distance-metric and end-to-end tests for the Phylotypes pipeline."""
 
 import io
+import itertools
 import json
 from pathlib import Path
 
@@ -117,3 +118,73 @@ def test_max_pregroup_size_splits_oversized_pregroups():
     p.generate_phylotypes()
     grouped = {sv for grp in p.phylogroups for sv in grp}
     assert grouped == {"sv1", "sv2", "sv3", "sv4"}
+
+
+def test_generate_phylotypes_incremental_partitions_all_svs():
+    """Mirrors test_generate_phylotypes_partitions_all_svs for the incremental path.
+
+    seed_size=1 / expand_batch_size=1 forces every stage (seed, apply, expand,
+    reconcile) to run on this 4-SV fixture.
+    """
+    for metric in ("legacy", "kr"):
+        p = _load(metric)
+        p.generate_phylotypes_incremental(seed_size=1, expand_batch_size=1)
+        grouped = {sv for grp in p.phylogroups for sv in grp}
+        assert grouped == {"sv1", "sv2", "sv3", "sv4"}, metric
+
+
+def _make_star_jplace(n_leaves: int = 20, svs_per_leaf: int = 15) -> dict:
+    """A star tree (root + n_leaves, each edge length 1.0) with svs_per_leaf
+    SVs placed identically (full LWR, zero distal length) on each leaf.
+
+    Distinct leaves are 2.0 apart and identical-leaf placements are 0 apart,
+    so with the default pd_threshold=1.0 each leaf's SVs form their own
+    phylotype, regardless of clustering strategy.
+    """
+    leaves = ",".join(f"L{i}:1.0[{i}]" for i in range(n_leaves))
+    tree = f"({leaves}):0.0[{n_leaves}];"
+    placements = [
+        {"p": [[i, -10, 1.0, 0.0, 0.01]], "nm": [[f"sv_{i:03d}_{j:03d}", 1]]}
+        for i in range(n_leaves)
+        for j in range(svs_per_leaf)
+    ]
+    return {
+        "version": 3,
+        "tree": tree,
+        "fields": ["edge_num", "likelihood", "like_weight_ratio", "distal_length", "pendant_length"],
+        "placements": placements,
+        "metadata": {},
+    }
+
+
+def _pairs_sharing_a_group(phylogroups):
+    sv_to_group = {sv: gi for gi, grp in enumerate(phylogroups) for sv in grp}
+    return {
+        (a, b)
+        for a, b in itertools.combinations(sorted(sv_to_group), 2)
+        if sv_to_group[a] == sv_to_group[b]
+    }
+
+
+def test_incremental_close_to_batch_on_synthetic_data():
+    """Medium synthetic test: incremental result should agree with batch on
+    most SV pairs (>= 90%), though exact equality is not expected since the
+    two paths use different linkage strategies."""
+    jplace = _make_star_jplace(n_leaves=20, svs_per_leaf=15)
+
+    p_batch = Phylotypes(lwr_overlap=0.1, pd_threshold=1.0, distance="legacy")
+    p_batch.load_jplace(io.StringIO(json.dumps(jplace)))
+    p_batch.generate_phylotypes()
+
+    p_inc = Phylotypes(lwr_overlap=0.1, pd_threshold=1.0, distance="legacy")
+    p_inc.load_jplace(io.StringIO(json.dumps(jplace)))
+    p_inc.generate_phylotypes_incremental(seed_size=10, expand_batch_size=25)
+
+    batch_svs = {sv for grp in p_batch.phylogroups for sv in grp}
+    inc_svs = {sv for grp in p_inc.phylogroups for sv in grp}
+    assert inc_svs == batch_svs
+
+    batch_pairs = _pairs_sharing_a_group(p_batch.phylogroups)
+    inc_pairs = _pairs_sharing_a_group(p_inc.phylogroups)
+    agreement = len(batch_pairs & inc_pairs) / len(batch_pairs)
+    assert agreement >= 0.9, agreement

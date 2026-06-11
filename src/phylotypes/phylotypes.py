@@ -15,6 +15,7 @@ import csv
 import itertools
 import json
 import logging
+import random
 import re
 import sys
 from collections import defaultdict
@@ -856,6 +857,224 @@ class Phylotypes:
                 [{self.placement_names[sv_i] for sv_i in phylotype_svs} for phylotype_svs in g_phylotype_svs.values()]
             )
 
+    def _sv_edges(self, sv_idx: int) -> Set[int]:
+        """Tree-edge (node-column) indices on which placement `sv_idx` has any weight."""
+        return set(self.placement_present[sv_idx].nonzero(as_tuple=True)[0].tolist())
+
+    def _group_edges(self, members: List[int]) -> Set[int]:
+        """Union of tree-edge (node-column) indices used by any placement in `members`."""
+        return set(self.placement_present[members].any(dim=0).nonzero(as_tuple=True)[0].tolist())
+
+    def _apply_sv(
+        self,
+        sv: int,
+        pool: List[Dict[str, Any]],
+        edge_index: Dict[int, Set[int]],
+        *,
+        distal_length: bool,
+        sample_size: int = 10,
+    ) -> bool:
+        """
+        Try to assign placement `sv` to an existing phylotype in `pool`.
+
+        Candidate phylotypes are found via `edge_index` (tree-edge overlap). If
+        there is exactly one candidate, `sv` is assigned to it. If there are
+        several, `sv` is assigned to the candidate with the smallest mean
+        distance to a sample of its members, provided that distance is within
+        `pd_threshold`.
+
+        On assignment, `pool[pt_i]["members"]` and `pool[pt_i]["edges"]` (and
+        `edge_index`) are updated in place.
+
+        Parameters
+        ----------
+        sv : int
+            Placement index to assign.
+        pool : List[Dict[str, Any]]
+            Current phylotype pool; each entry has "members" (List[int]) and
+            "edges" (Set[int]).
+        edge_index : Dict[int, Set[int]]
+            Inverted index mapping tree-edge index to the set of phylotype
+            indices (into `pool`) placed on that edge.
+        distal_length : bool
+            Whether to include distal length in distance calculations.
+        sample_size : int, optional
+            Number of members to sample per candidate phylotype when comparing
+            distances (default: 10).
+
+        Returns
+        -------
+        bool
+            True if `sv` was assigned to a phylotype, False if it is an orphan.
+        """
+        sv_edges = self._sv_edges(sv)
+        candidates: Set[int] = set()
+        for edge in sv_edges:
+            candidates.update(edge_index.get(edge, ()))
+
+        if not candidates:
+            return False
+
+        if len(candidates) == 1:
+            pt_i = next(iter(candidates))
+        else:
+            best: Optional[Tuple[float, int]] = None
+            for cand in candidates:
+                members = pool[cand]["members"]
+                sample = members if len(members) <= sample_size else random.sample(members, sample_size)
+                dist = self.pairwise_distance([sv, *sample], distal_length=distal_length)
+                mean_dist = float(dist[0, 1:].mean())
+                if best is None or mean_dist < best[0]:
+                    best = (mean_dist, cand)
+            if best is None or best[0] > self.pd_threshold:
+                return False
+            pt_i = best[1]
+
+        pool[pt_i]["members"].append(sv)
+        new_edges = sv_edges - pool[pt_i]["edges"]
+        pool[pt_i]["edges"].update(new_edges)
+        for edge in new_edges:
+            edge_index[edge].add(pt_i)
+        return True
+
+    def generate_phylotypes_incremental(
+        self,
+        distal_length: bool = True,
+        seed_size: int = 200,
+        expand_batch_size: int = 200,
+    ) -> None:
+        """
+        Group features into phylotypes incrementally (seed -> apply -> expand -> reconcile).
+
+        An alternative to `generate_phylotypes` for datasets too large for a single
+        O(n^2) distance matrix and clustering pass. Builds an initial phylotype pool
+        from a small "seed" of the most specific placements (Stage A), indexes each
+        phylotype by the tree edges its members are placed on (Stage B), streams the
+        remaining placements through that index -- assigning each to a matching
+        phylotype within `pd_threshold` or marking it an orphan (Stage C), repeatedly
+        clusters and absorbs orphans into new phylotypes (Stage D), and finally does
+        one cheap pass merging phylotype representatives that ended up close together
+        (Stage E).
+
+        Design note
+        -----------
+        The batch path (`generate_phylotypes`) clusters each pregroup with average
+        linkage over its full pairwise distance matrix. This streaming scheme instead
+        assigns each placement by its distance to a *sample* of an existing
+        phylotype's members -- behavior closer to single/centroid linkage. Near
+        phylotype boundaries, some placements may therefore be grouped differently
+        than they would be by the batch path. This is an accepted, explicit
+        trade-off in exchange for bounded (`O(K*m + seed_size^2 + expand_batch_size^2)`)
+        memory instead of `O(n^2)`.
+
+        Parameters
+        ----------
+        distal_length : bool, optional
+            Whether to include distal length in distance calculations (default: True)
+        seed_size : int, optional
+            Number of (most specific) placements used to seed the initial phylotype
+            pool via the batch clusterer (default: 200)
+        expand_batch_size : int, optional
+            Maximum number of orphaned placements clustered together per EXPAND pass
+            (default: 200)
+
+        Raises
+        ------
+        ValueError
+            If required placement tensors or the tree are not built/loaded
+        """
+        if not hasattr(self, "placement_lwr"):
+            msg = "Placement tensor must be built first"
+            raise ValueError(msg)
+        if self.tree is None:
+            msg = "Tree must be loaded"
+            raise ValueError(msg)
+
+        # Most specific placements (fewest placement nodes) first.
+        order = torch.argsort(self.placement_present.sum(dim=1)).tolist()
+        seed_idx = order[:seed_size]
+        remaining = order[seed_size:]
+
+        # ---- Stage A: SEED ----
+        pool: List[Dict[str, Any]] = []
+        if len(seed_idx) == 1:
+            pool.append({"members": [seed_idx[0]], "edges": self._sv_edges(seed_idx[0])})
+        elif len(seed_idx) > 1:
+            seed_dist = self.pairwise_distance(seed_idx, distal_length=distal_length)
+            seed_clusters = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=self.pd_threshold,
+                metric="precomputed",
+                linkage="average",
+            ).fit_predict(seed_dist)
+            seed_groups: Dict[int, List[int]] = defaultdict(list)
+            for local_i, cl in enumerate(seed_clusters):
+                seed_groups[cl].append(seed_idx[local_i])
+            for members in seed_groups.values():
+                pool.append({"members": members, "edges": self._group_edges(members)})
+
+        # ---- Stage B: edge -> phylotype inverted index ----
+        edge_index: Dict[int, Set[int]] = defaultdict(set)
+        for pt_i, pt in enumerate(pool):
+            for edge in pt["edges"]:
+                edge_index[edge].add(pt_i)
+
+        # ---- Stage C: APPLY (stream the rest) ----
+        orphans: List[int] = [
+            sv for sv in remaining if not self._apply_sv(sv, pool, edge_index, distal_length=distal_length)
+        ]
+
+        # ---- Stage D: EXPAND ----
+        while orphans:
+            batch, orphans = orphans[:expand_batch_size], orphans[expand_batch_size:]
+            if len(batch) == 1:
+                new_groups = [batch]
+            else:
+                batch_dist = self.pairwise_distance(batch, distal_length=distal_length)
+                batch_clusters = AgglomerativeClustering(
+                    n_clusters=None,
+                    distance_threshold=self.pd_threshold,
+                    metric="precomputed",
+                    linkage="average",
+                ).fit_predict(batch_dist)
+                batch_groups: Dict[int, List[int]] = defaultdict(list)
+                for local_i, cl in enumerate(batch_clusters):
+                    batch_groups[cl].append(batch[local_i])
+                new_groups = list(batch_groups.values())
+
+            for members in new_groups:
+                pt_i = len(pool)
+                edges = self._group_edges(members)
+                pool.append({"members": members, "edges": edges})
+                for edge in edges:
+                    edge_index[edge].add(pt_i)
+
+            orphans = [sv for sv in orphans if not self._apply_sv(sv, pool, edge_index, distal_length=distal_length)]
+
+        # ---- Stage E: RECONCILE ----
+        if len(pool) > 1:
+            lcas = [self._get_lca_for_group(pt["members"]) for pt in pool]
+            lca_mat = np.zeros((len(pool), len(pool)), dtype=np.float64)
+            for i in range(len(pool)):
+                for j in range(i + 1, len(pool)):
+                    pd_ij = lcas[i].distance(lcas[j])
+                    lca_mat[i, j] = pd_ij
+                    lca_mat[j, i] = pd_ij
+            rep_clusters = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=self.pd_threshold,
+                metric="precomputed",
+                linkage="average",
+            ).fit_predict(lca_mat)
+            merged: Dict[int, List[int]] = defaultdict(list)
+            for pt_i, cl in enumerate(rep_clusters):
+                merged[cl].extend(pool[pt_i]["members"])
+            final_groups = list(merged.values())
+        else:
+            final_groups = [pt["members"] for pt in pool]
+
+        self.phylogroups.extend({self.placement_names[sv_i] for sv_i in members} for members in final_groups)
+
     def to_long(self) -> List[Tuple[str, str]]:
         """
         Convert phylogroups to long format for output.
@@ -993,6 +1212,31 @@ def main() -> None:
         type=int,
     )
 
+    args_parser.add_argument(
+        "--incremental",
+        help="Use the incremental seed->apply->expand->reconcile clustering path "
+        "instead of the batch path. Scales to larger inputs at the cost of an "
+        "approximate (single/centroid-like) linkage near phylotype boundaries. "
+        "(Default: False).",
+        action="store_true",
+    )
+
+    args_parser.add_argument(
+        "--seed-size",
+        help="Number of (most specific) placements used to seed the initial phylotype "
+        "pool when --incremental is set. (Default: 200).",
+        default=200,
+        type=int,
+    )
+
+    args_parser.add_argument(
+        "--expand-batch-size",
+        help="Maximum number of orphaned placements clustered together per EXPAND pass "
+        "when --incremental is set. (Default: 200).",
+        default=200,
+        type=int,
+    )
+
     args = args_parser.parse_args()
 
     phylotypes = Phylotypes(
@@ -1007,7 +1251,13 @@ def main() -> None:
     except ValueError as e:
         logging.error(e)
         sys.exit(1)
-    phylotypes.generate_phylotypes()
+    if args.incremental:
+        phylotypes.generate_phylotypes_incremental(
+            seed_size=args.seed_size,
+            expand_batch_size=args.expand_batch_size,
+        )
+    else:
+        phylotypes.generate_phylotypes()
 
     logging.info("Done Phylogrouping. Outputting.")
     phylotypes.to_csv(args.out)
