@@ -111,7 +111,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["D104", "F401"]
-"tests/**/*" = ["S101", "D", "S603", "S607"]
+"tests/**/*" = ["S101", "D", "S603", "S607", "INP001"]
 "examples/**/*" = ["T201", "D"]
 
 [tool.ruff.lint.mccabe]
