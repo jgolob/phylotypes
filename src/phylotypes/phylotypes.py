@@ -88,11 +88,9 @@ class Phylotypes:
     node_name : Dict[TreeNode, int]
         Dictionary mapping TreeNode objects to node IDs
     node_names : List[str]
-        List of node names in consistent order for tree node distance matrix
+        List of node names in consistent order for tensor alignment
     node_name_to_idx : Dict[str, int]
         Dictionary mapping node names to their index in node_names
-    tree_node_distance_matrix : Optional[torch.Tensor]
-        torch tensor of shape (n_nodes, n_nodes) with pairwise tree node distances
     """
 
     required_fields = ["fields", "placements", "tree"]
@@ -135,10 +133,9 @@ class Phylotypes:
         self.name_node: Dict[str, TreeNode] = {}
         self.node_name: Dict[TreeNode, str] = {}
 
-        # Tree node distance matrix and node indexing
+        # Node indexing
         self.node_names: List[str] = []
         self.node_name_to_idx: Dict[str, int] = {}
-        self.tree_node_distance_matrix: Optional[torch.Tensor] = None
 
         # Groupings
         self._pregrouped_sv: List[List[int]] = []
@@ -240,46 +237,6 @@ class Phylotypes:
 
         self.name_node = {n.name: n for n in self.tree.traverse() if n.name is not None}
         self.node_name = {v: k for k, v in self.name_node.items()}
-
-    def _get_tree_node_distance_matrix(
-        self,
-        node_indices: Optional[List[int]] = None,
-    ) -> Optional[torch.Tensor]:
-        """
-        Generate pairwise tree node distances
-
-        Generates:
-        tree_node_distance_matrix: Tensor of shape (n_nodes, n_nodes)
-            Contains pairwise distances
-
-
-        """
-        if self.tree is None or self.node_names is None or self.node_name_to_idx is None:
-            logging.warning("No tree loaded, cannot generate distance matrix")
-            return None
-        # Implict else
-
-        if node_indices is not None:
-            node_names = [self.node_names[nid] for nid in node_indices]
-        else:
-            node_names = self.node_names
-
-        n_nodes = len(node_names)
-        logging.info(
-            "Starting pairwise tree node distance matrix generation on %d nodes, or %d pairs", n_nodes, n_nodes**2
-        )
-
-        tree_node_distance_matrix = torch.zeros((n_nodes, n_nodes), dtype=torch.float32)
-
-        # Simple O(n^2) approach
-        for i, node_name_i in enumerate(node_names):
-            node_i = self.name_node[node_name_i]
-            for j, node_name_j in enumerate(node_names[i + 1 :], start=i + 1):
-                node_j = self.name_node[node_name_j]
-                pdist = node_i.distance(node_j)
-                tree_node_distance_matrix[i, j] = pdist
-                tree_node_distance_matrix[j, i] = pdist
-        return tree_node_distance_matrix
 
     def _load_placements(self) -> None:
         """
