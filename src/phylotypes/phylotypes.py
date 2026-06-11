@@ -101,6 +101,7 @@ class Phylotypes:
         pd_threshold: float = 1.0,
         distance: str = "legacy",
         device: str = "cpu",
+        max_pregroup_size: int = 5000,
     ) -> None:
         """
         Initialize Phylotypes instance with clustering parameters.
@@ -117,6 +118,12 @@ class Phylotypes:
             "kr" (true tree-Wasserstein / Kantorovich-Rubinstein distance, opt-in)
         device : str, optional
             torch device to use for tensor computations, e.g. "cpu" or "cuda" (default: "cpu")
+        max_pregroup_size : int, optional
+            Maximum number of SVs allowed in a single pregroup after LCA-based
+            re-clustering. Pregroups that would exceed this are split back into
+            their pre-merge constituent groups, to bound the O(n^2) memory used
+            by the pairwise distance matrix and clustering for that group
+            (default: 5000)
         """
         if distance not in ("legacy", "kr"):
             msg = f"Unknown distance metric: {distance!r}. Must be 'legacy' or 'kr'."
@@ -127,6 +134,7 @@ class Phylotypes:
         self.pd_threshold: float = pd_threshold
         self.distance: str = distance
         self.device: torch.device = torch.device(device)
+        self.max_pregroup_size: int = max_pregroup_size
 
         # Data containers
         self.phylogroups: List[Set[str]] = []
@@ -763,7 +771,18 @@ class Phylotypes:
         for old_cluster_idx, new_cluster_idx in enumerate(g_lca_clusters):
             new_old_sv_groups[new_cluster_idx].add(old_cluster_idx)
 
-        new_sv_groups = [list(set([sv for idx in olds for sv in groups[idx]])) for olds in new_old_sv_groups.values()]
+        new_sv_groups = []
+        for olds in new_old_sv_groups.values():
+            merged = list({sv for idx in olds for sv in groups[idx]})
+            if len(merged) > self.max_pregroup_size:
+                logging.warning(
+                    "Pregroup of %d exceeds max_pregroup_size=%d; keeping it unmerged.",
+                    len(merged),
+                    self.max_pregroup_size,
+                )
+                new_sv_groups.extend(list(groups[idx]) for idx in olds)
+            else:
+                new_sv_groups.append(merged)
 
         logging.debug(
             "Now {} groups, with the largest {} items".format(
@@ -965,6 +984,15 @@ def main() -> None:
         default="cpu",
     )
 
+    args_parser.add_argument(
+        "--max-pregroup-size",
+        help="Maximum SVs in a single pregroup after LCA-based re-clustering; larger "
+        "pregroups are split back into their pre-merge groups to bound memory use. "
+        "(Default: 5000).",
+        default=5000,
+        type=int,
+    )
+
     args = args_parser.parse_args()
 
     phylotypes = Phylotypes(
@@ -972,6 +1000,7 @@ def main() -> None:
         pd_threshold=args.threshold_pd,
         distance=args.distance,
         device=args.device,
+        max_pregroup_size=args.max_pregroup_size,
     )
     try:
         phylotypes.load_jplace(args.jplace)

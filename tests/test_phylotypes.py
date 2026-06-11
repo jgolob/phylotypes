@@ -103,3 +103,17 @@ def test_missing_tree_raises():
                                               "distal_length"], "placements": []}))
     with pytest.raises(ValueError):
         p.load_jplace(bad)
+
+
+def test_max_pregroup_size_splits_oversized_pregroups():
+    """A max_pregroup_size of 0 forces every merged pregroup to be split back
+    into its pre-merge groups; all SVs must still appear, exactly once."""
+    p = _load("legacy")
+    p.max_pregroup_size = 0
+    p._pregroup_by_lwr()
+    all_svs = [p.placement_names[i] for grp in p._pregrouped_sv for i in grp]
+    assert sorted(all_svs) == ["sv1", "sv2", "sv3", "sv4"]
+
+    p.generate_phylotypes()
+    grouped = {sv for grp in p.phylogroups for sv in grp}
+    assert grouped == {"sv1", "sv2", "sv3", "sv4"}
