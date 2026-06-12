@@ -677,9 +677,9 @@ class Phylotypes:
         """
         return self.tree.lowest_common_ancestor(  # type: ignore
             {
-                self.name_node[self.node_names[nid.item()]]
+                self.name_node[self.node_names[nid]]
                 for g_i in group
-                for nid in self.placement_present[g_i].nonzero().numpy().flatten()
+                for nid in self.placement_present[g_i].nonzero().flatten().tolist()
             }
         )
 
