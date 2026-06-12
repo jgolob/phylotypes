@@ -845,7 +845,7 @@ class Phylotypes:
                 distance_threshold=self.pd_threshold,
                 metric="precomputed",
                 linkage="average",
-            ).fit_predict(g_sv_dist_mat)
+            ).fit_predict(g_sv_dist_mat.cpu().numpy())
 
             # Map clusters to feature sets
             g_phylotype_svs = defaultdict(set)
@@ -1006,7 +1006,7 @@ class Phylotypes:
                 distance_threshold=self.pd_threshold,
                 metric="precomputed",
                 linkage="average",
-            ).fit_predict(seed_dist)
+            ).fit_predict(seed_dist.cpu().numpy())
             seed_groups: Dict[int, List[int]] = defaultdict(list)
             for local_i, cl in enumerate(seed_clusters):
                 seed_groups[cl].append(seed_idx[local_i])
@@ -1036,7 +1036,7 @@ class Phylotypes:
                     distance_threshold=self.pd_threshold,
                     metric="precomputed",
                     linkage="average",
-                ).fit_predict(batch_dist)
+                ).fit_predict(batch_dist.cpu().numpy())
                 batch_groups: Dict[int, List[int]] = defaultdict(list)
                 for local_i, cl in enumerate(batch_clusters):
                     batch_groups[cl].append(batch[local_i])
