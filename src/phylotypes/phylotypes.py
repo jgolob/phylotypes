@@ -246,7 +246,8 @@ class Phylotypes:
 
         # Cleanup node names...
         for node in self.tree.traverse():
-            node.name = node.name.replace("{", "").replace("}", "")
+            if node.name is not None:
+                node.name = node.name.replace("{", "").replace("}", "")
 
         self.name_node = {n.name: n for n in self.tree.traverse() if n.name is not None}
         self.node_name = {v: k for k, v in self.name_node.items()}
