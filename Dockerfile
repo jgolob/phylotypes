@@ -1,0 +1,8 @@
+FROM python:3.13-slim
+
+ARG PHYLOTYPES_VERSION
+ENV PHYLOTYPES_VERSION=${PHYLOTYPES_VERSION}
+
+RUN pip install --no-cache-dir "phylotypes==${PHYLOTYPES_VERSION}"
+
+ENTRYPOINT ["phylotypes"]
