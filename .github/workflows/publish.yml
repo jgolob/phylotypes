@@ -80,6 +80,15 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest
 
+      - name: Wait for phylotypes==${{ steps.version.outputs.version }} on PyPI
+        run: |
+          for i in $(seq 1 20); do
+            pip index versions phylotypes 2>/dev/null | grep -qF "${{ steps.version.outputs.version }}" && exit 0
+            echo "Attempt $i: not yet on PyPI, waiting 30s..."
+            sleep 30
+          done
+          echo "Timed out waiting for PyPI propagation" && exit 1
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
