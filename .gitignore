@@ -4,6 +4,11 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
 dist/
 build/
+
+# Do not commit lock files: pinned wheels (notably torch) break multiplatform installs.
+# pyproject.toml dependency ranges are the source of truth.
+uv.lock
 poetry.lock
