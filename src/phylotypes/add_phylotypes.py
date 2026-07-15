@@ -1,262 +1,309 @@
 #!/usr/bin/env python3
+"""Add a new set of placed sequence variants to an existing set of phylotypes.
 
-# # Objective: Add a new set of placements to an existing set of phylotypes.
+Given a previous JPLACE + its phylotype assignments (as produced by
+``phylotypes``), and a new JPLACE of sequence variants placed on the *same*
+reference tree, assign each new SV into one of the existing phylotypes.
+
+This module reuses :class:`phylotypes.phylotypes.Phylotypes` for both JPLACE
+loading (which normalizes the SEPP/edge-numbered tree format and validates the
+required fields) and pairwise distance computation, so there is a single,
+tested code path for parsing and the legacy distance metric.
+"""
 
 import argparse
-import logging
-import numpy as np
-from Bio import Phylo
-from skbio import TreeNode
-import json
-from io import StringIO
 from collections import defaultdict
 import csv
+import io
+import json
+import logging
+from pathlib import Path
+import random
 import sys
+from typing import Any, TextIO
+
+from phylotypes.phylotypes import Phylotypes
 
 
-def placement_pairwise_distance(pl_1, pl_2, jplace):
-    pl_1_lwr_total = sum((p[0] for p in pl_1.values()))
-    pl_2_lwr_total = sum((p[0] for p in pl_2.values()))
-    # Initialize the distance as zero
-    paired_dist = 0
-    # Overlapped nodes, we to do a bit of weighted averaging
-    overlap_nodes = set(pl_1).intersection(set(pl_2))
-    paired_dist += sum([
-        pl_1[n][1] * pl_1[n][0] / pl_1_lwr_total + pl_2[n][1] * pl_2[n][0] / pl_2_lwr_total
-        for n in overlap_nodes
-    ])
+def read_phylotype_csv(fh: TextIO) -> dict[str, str]:
+    """Read a two-column ``phylotype,sv`` CSV into an ``sv -> phylotype`` map.
 
-    distant_nodes = set(pl_1).union(set(pl_2)) - set(pl_1).intersection(set(pl_2))
-    if len(distant_nodes) > 0:
-        # Determine the lowest common ancestor of the distant nodes for this pair
-        svp_lca = jplace.tree.lowest_common_ancestor(
-            [
-                jplace.name_node.get(nid)
-                for nid in distant_nodes
-            ]
-        )
-        # Add weighted average distance of SV1 to the LCA
-        # and SV2 to the LCA to the paired_distacne
-        paired_dist += (sum([
-            (np[1] + svp_lca.distance(jplace.name_node[nid])) * np[0]
-            for nid, np in pl_1.items()
-            if nid in distant_nodes
-        ]) / pl_1_lwr_total + sum([
-            (np[1] + svp_lca.distance(jplace.name_node[nid])) * np[0]
-            for nid, np in pl_2.items()
-            if nid in distant_nodes
-        ]) / pl_2_lwr_total)
-    return paired_dist
+    Parameters
+    ----------
+    fh : TextIO
+        File handle for the phylotype CSV (as written by ``phylotypes``).
+
+    Returns
+    -------
+    Dict[str, str]
+        Mapping of each sequence-variant name to its phylotype id.
+
+    Raises
+    ------
+    ValueError
+        If the CSV is missing the ``phylotype`` or ``sv`` column.
+    """
+    reader = csv.DictReader(fh)
+    fields = set(reader.fieldnames or [])
+    for required in ("phylotype", "sv"):
+        if required not in fields:
+            msg = f"Phylotype CSV is missing the required '{required}' column."
+            raise ValueError(msg)
+    return {row["sv"]: row["phylotype"] for row in reader}
 
 
-def calculate_sv_pt_distance(new_sv, new_jplace, pt_svs, old_jplace):
-    # First placement is the new SV
+def _placement_names(jplace: dict[str, Any]) -> set[str]:
+    """Collect every sequence-variant name declared in a JPLACE dict."""
+    names: set[str] = set()
+    for placement in jplace.get("placements", []):
+        for sv, _ in placement.get("nm", []):
+            names.add(sv)
+        for sv in placement.get("n", []):
+            names.add(sv)
+    return names
 
-    pl_1 = {
-        nid:
-        (
-            npl[new_jplace.lwr_idx],
-            npl[new_jplace.dl_idx]
-        )
-        for nid, npl in new_jplace.sv_nodes[new_sv].items()
+
+def build_combined(
+    previous_fh: TextIO,
+    new_fh: TextIO,
+    device: str = "cpu",
+    distance: str = "legacy",
+) -> tuple[Phylotypes, set[str], set[str]]:
+    """Load the previous and new JPLACE into a single ``Phylotypes`` instance.
+
+    Both sets of placements are loaded onto the same reference tree so that the
+    tested :meth:`Phylotypes.pairwise_distance` can score a new SV against the
+    existing phylotype members in one shared tensor space.
+
+    Parameters
+    ----------
+    previous_fh : TextIO
+        File handle for the previous JPLACE.
+    new_fh : TextIO
+        File handle for the new JPLACE (placed on the same reference tree).
+    device : str, optional
+        torch device passed through to ``Phylotypes`` (default: ``"cpu"``).
+    distance : str, optional
+        Pairwise distance metric, ``"legacy"`` or ``"kr"`` (default: ``"legacy"``).
+
+    Returns
+    -------
+    Tuple[Phylotypes, Set[str], Set[str]]
+        The loaded ``Phylotypes`` instance, the set of previous SV names, and
+        the set of new SV names.
+
+    Raises
+    ------
+    ValueError
+        If either JPLACE is missing required keys, or the two JPLACE files do
+        not share the same ``fields`` and reference ``tree``.
+    """
+    previous = json.load(previous_fh)
+    new = json.load(new_fh)
+
+    for label, jplace in (("previous", previous), ("new", new)):
+        for key in ("fields", "tree", "placements"):
+            if key not in jplace:
+                msg = f"Missing required '{key}' entry in {label} jplace."
+                raise ValueError(msg)
+
+    if previous["fields"] != new["fields"]:
+        msg = "Previous and new jplace declare different 'fields'; they must match."
+        raise ValueError(msg)
+    if previous["tree"].strip() != new["tree"].strip():
+        msg = "Previous and new jplace must be placed on the same reference tree."
+        raise ValueError(msg)
+
+    previous_names = _placement_names(previous)
+    new_names = _placement_names(new)
+
+    merged = {
+        "fields": previous["fields"],
+        "tree": previous["tree"],
+        "placements": previous["placements"] + new["placements"],
     }
-    return [
-        placement_pairwise_distance(pl_1, {
-        nid: (
-            npl[old_jplace.lwr_idx],
-            npl[old_jplace.dl_idx]
-        )
-        for nid, npl in old_jplace.sv_nodes[sv].items()
-        }, old_jplace)
-        for sv in pt_svs
-    ]
+    combined = Phylotypes(device=device, distance=distance)
+    combined.load_jplace(io.StringIO(json.dumps(merged)))
+    return combined, previous_names, new_names
 
 
-class Jplace():
-    lwr_overlap = 0.1
-    pd_threshold = 1.0
+def assign_new_svs(
+    combined: Phylotypes,
+    sv_pt: dict[str, str],
+    new_names: set[str],
+    *,
+    distal_length: bool = True,
+    sample_size: int = 10,
+) -> tuple[dict[str, str], set[str]]:
+    """Assign each new SV to an existing phylotype by edge overlap and distance.
 
-    def __init__(self, jplace_fh):
-        # Set up some reasonable instance defaults
-        self.jplace = None
-        self.phylogroups = []
-        self.sv_groups = []
+    For each new SV, candidate phylotypes are those sharing at least one tree
+    edge with the SV's placement. With a single candidate the SV joins it; with
+    several, the SV joins the phylotype with the smallest mean distance to a
+    random sample of that phylotype's members; with none, the SV is an orphan.
 
-        logging.info("Loading jplace file")
-        self.jplace = json.load(
-            jplace_fh
-        )
-        if 'fields' not in self.jplace:
-            logging.error("Missing required 'fields' entry in jplace. Exiting")
-            return
-        if 'placements' not in self.jplace:
-            logging.error("Missing required 'placements' entry in jplace. Exiting")
-            return
-        if 'tree' not in self.jplace:
-            logging.error("Missing required 'tree' entry in jplace. Exiting")
-            return
-        logging.info("Indexing fields")
-        try:
-            self.edge_idx = self.jplace['fields'].index('edge_num')
-            self.lwr_idx = self.jplace['fields'].index('like_weight_ratio')
-            self.dl_idx = self.jplace['fields'].index('distal_length')
-        except ValueError:
-            logging.error("Missing a needed field (edge_num, like_weight_ratio, distal length")
-            return
+    Parameters
+    ----------
+    combined : Phylotypes
+        A ``Phylotypes`` holding both previous and new placements (from
+        :func:`build_combined`).
+    sv_pt : Dict[str, str]
+        Mapping of previous SV name to phylotype id.
+    new_names : Set[str]
+        Names of the SVs to be added.
+    distal_length : bool, optional
+        Whether to include distal length in distance calculations (default: True).
+    sample_size : int, optional
+        Maximum number of members sampled per candidate phylotype when comparing
+        distances (default: 10).
 
-        logging.info("Loading tree")
-        self.__load_tree__()
-        logging.info("Loading and caching placements")
-        self.__load_placements__()
+    Returns
+    -------
+    Tuple[Dict[str, str], Set[str]]
+        A mapping of assigned new SV name to phylotype id, and the set of
+        orphaned new SV names (no overlapping phylotype).
+    """
+    pt_edges: dict[str, set[int]] = defaultdict(set)
+    pt_members: dict[str, list[str]] = defaultdict(list)
+    for sv, pt in sv_pt.items():
+        pt_edges[pt].update(combined.sv_nodes[sv].keys())
+        pt_members[pt].append(sv)
 
-    def __load_tree__(self):
-        tp = Phylo.read(
-            StringIO(self.jplace['tree']),
-            'newick'
-        )
-        with StringIO() as th:
-            Phylo.write(tp, th, 'newick')
-            th.seek(0)
-            self.tree = TreeNode.read(th)
-        self.name_node = {
-            int(n.name.replace('{', "").replace('}', '')): n
-            for n in self.tree.traverse() if n.name is not None
-        }
-        self.node_name = {
-            v: k
-            for k, v in self.name_node.items()
-        }
+    new_sv_pt: dict[str, str] = {}
+    orphans: set[str] = set()
 
-    def __load_placements__(self):
-        self.sv_nodes = {}
-        for pl in self.jplace['placements']:
-            pl_nodes = {
-                p[self.edge_idx]: p
-                for p in pl['p']
-            }
-            if 'nm' in pl:
-                for sv, w in pl['nm']:
-                    self.sv_nodes[sv] = pl_nodes
-            if 'n' in pl:
-                for sv in pl['n']:
-                    self.sv_nodes[sv] = pl_nodes
+    for new_sv in sorted(new_names):
+        new_edges = set(combined.sv_nodes[new_sv].keys())
+        candidates = [pt for pt, edges in pt_edges.items() if edges & new_edges]
+
+        if not candidates:
+            orphans.add(new_sv)
+            continue
+        if len(candidates) == 1:
+            new_sv_pt[new_sv] = candidates[0]
+            continue
+
+        new_idx = combined.placement_idx[new_sv]
+        best_pt = candidates[0]
+        best_dist = float("inf")
+        for pt in candidates:
+            members = pt_members[pt]
+            sample = members if len(members) <= sample_size else random.sample(members, sample_size)
+            idxs = [new_idx, *(combined.placement_idx[m] for m in sample)]
+            dist = combined.pairwise_distance(idxs, distal_length=distal_length)
+            mean_dist = float(dist[0, 1:].mean())
+            if mean_dist < best_dist:
+                best_dist = mean_dist
+                best_pt = pt
+        new_sv_pt[new_sv] = best_pt
+
+    return new_sv_pt, orphans
 
 
-def main():
+def main() -> None:
+    """Command-line entry point for adding new SVs into existing phylotypes."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s [add_phylotypes] %(message)s",
+    )
+
     args_parser = argparse.ArgumentParser(
         description="""Given a baseline set of placed sequence variants grouped into phylotypes,
-        put a new set of sequence variants placed on the same reference tree into the existing phylotypes. 
-        """
+        put a new set of sequence variants placed on the same reference tree into the existing
+        phylotypes.""",
     )
     args_parser.add_argument(
-        '--previous_jp', '-P',
-        help='Previous JPLACE file, as created by pplacer or epa-ng',
-        type=argparse.FileType('r'),
-        required=True
+        "--previous_jp",
+        "-P",
+        help="Previous JPLACE file, as created by pplacer or epa-ng",
+        type=Path,
+        required=True,
     )
     args_parser.add_argument(
-        '--previous_phylotypes', '-p',
-        help='CSV file with two columns: phylotype and sv. Represents the existing phylotypes',
-        type=argparse.FileType('r'),
-        required=True
+        "--previous_phylotypes",
+        "-p",
+        help="CSV file with two columns: phylotype and sv. Represents the existing phylotypes",
+        type=Path,
+        required=True,
     )
     args_parser.add_argument(
-        '--new_jp', '-N',
-        help='NEW JPLACE file, as created by pplacer or epa-ng, containing placed sequence variants to be added',
-        type=argparse.FileType('r'),
-        required=True
+        "--new_jp",
+        "-N",
+        help="NEW JPLACE file, as created by pplacer or epa-ng, containing placed sequence variants to be added",
+        type=Path,
+        required=True,
     )
     args_parser.add_argument(
-        '--out', '-O',
-        help='Output CSV file with the new SV into the existing phylotypes',
-        type=argparse.FileType('wt'),
-        required=True
+        "--out",
+        "-O",
+        help="Output CSV file placing the new SVs into the existing phylotypes",
+        type=Path,
+        required=True,
+    )
+    args_parser.add_argument(
+        "--no-distal-length",
+        "-ndl",
+        help="Ignore distal length to nodes. (Default: False)",
+        action="store_true",
+    )
+    args_parser.add_argument(
+        "--device",
+        help="torch device for tensor computations, e.g. 'cpu' or 'cuda'. (Default: cpu).",
+        default="cpu",
+    )
+    args_parser.add_argument(
+        "--distance",
+        "-D",
+        help="Pairwise distance metric: 'legacy' (default; reproduces prior phylotypes) or "
+        "'kr' (true tree-Wasserstein distance). (Default: legacy).",
+        choices=["legacy", "kr"],
+        default="legacy",
     )
     args = args_parser.parse_args()
 
-    logging.info("Loading Previous placements and phylogroups")
-    old_jp = Jplace(args.previous_jp)
-    cur_pt = {
-        r['sv']: r['phylotype']
-        for r in csv.DictReader(args.previous_phylotypes)
-    }
-    pt_sv = defaultdict(set)
-    for sv, pt in cur_pt.items():
-        pt_sv[pt].add(sv)
-
-    # Verify these overlap
     try:
-        assert set(old_jp.sv_nodes.keys()) == set(cur_pt.keys())
-    except AssertionError:
-        logging.error("Phylotypes and jplace do not match")
-        sys.exit(-1)
-    # Convert to a phylotype -> contained SV
-    pt_sv = defaultdict(set)
-    for sv, pt in cur_pt.items():
-        pt_sv[pt].add(sv)
+        logging.info("Loading previous phylotype assignments")
+        with args.previous_phylotypes.open() as pt_fh:
+            sv_pt = read_phylotype_csv(pt_fh)
 
-    # And lookup edges
-    pt_edges = defaultdict(set)
-    for sv, pt_id in cur_pt.items():
-        pt_edges[pt_id].update(
-            old_jp.sv_nodes[sv].keys()
-        )
-
-    logging.info("Loading NEW jplace and contained placements")
-    new_jp = Jplace(args.new_jp)
-
-    new_sv_pt = {}
-    orphaned_new_sv = set()
-
-    for new_sv, new_sv_nodes in new_jp.sv_nodes.items():
-        overlap_edges = sorted([
-            (
-                pt,
-                len(
-                    pte.intersection(new_sv_nodes.keys())
-                )
+        logging.info("Loading previous and new jplace onto the shared reference tree")
+        with args.previous_jp.open() as prev_fh, args.new_jp.open() as new_fh:
+            combined, previous_names, new_names = build_combined(
+                prev_fh,
+                new_fh,
+                device=args.device,
+                distance=args.distance,
             )
-            for pt, pte in pt_edges.items()
-            if len(pte.intersection(new_sv_nodes.keys())) > 0
-        ], key=lambda v: -1*v[1])
-        if len(overlap_edges) == 1:
-            new_sv_pt[new_sv] = overlap_edges[0][0]
-        elif len(overlap_edges) == 0:
-            # No overlaps. Think about making new phylotype(s) for these SV later
-            orphaned_new_sv.add(new_sv)
-        else:
-            # There are multiple overlapping phylotypes.
-            # pick the phylogroup withe shortest average distance
-            # to the new sv
-            # Take a random sample of only 10 of the existing SV in each phylotype to speed things up.
-            nsv_pt_dist = sorted([
-                (
-                    pt,
-                    np.mean(calculate_sv_pt_distance(
-                        new_sv,
-                        new_jp,
-                        np.random.choice(
-                            list(pt_sv[pt]),
-                            size=min(len(pt_sv[pt]), 10),
-                            replace=False
-                        ),
-                        old_jp
-                    ))
-                )
-                for pt, pt_olc in overlap_edges
-            ], key=lambda v: v[1])
-            new_sv_pt[new_sv] = nsv_pt_dist[0][0]
 
-    if len(orphaned_new_sv) > 0:
-        logging.error(f"Could not add {len(orphaned_new_sv)} of {len(orphaned_new_sv) + len(new_sv_pt)} sequence variants into the existing phylotypes.")
+        if previous_names != set(sv_pt.keys()):
+            msg = "Previous jplace and previous-phylotype CSV describe different sets of SVs."
+            raise ValueError(msg)
+    except ValueError as e:
+        logging.error(e)
+        sys.exit(1)
 
-    print(
-        f"Successfully integrated {len(new_sv_pt)} of {len(orphaned_new_sv) + len(new_sv_pt)} sequence variants into the existing phylotypes."
+    logging.info("Assigning %d new SV into the existing phylotypes", len(new_names))
+    new_sv_pt, orphans = assign_new_svs(
+        combined,
+        sv_pt,
+        new_names,
+        distal_length=not args.no_distal_length,
     )
-    w = csv.writer(args.out)
-    w.writerow(['phylotype', 'sv'])
-    for sv, pt in new_sv_pt.items():
-        w.writerow([pt, sv])
+
+    total = len(new_sv_pt) + len(orphans)
+    if orphans:
+        logging.warning(
+            "Could not add %d of %d sequence variants (no overlapping phylotype).",
+            len(orphans),
+            total,
+        )
+    logging.info("Successfully integrated %d of %d sequence variants.", len(new_sv_pt), total)
+
+    with args.out.open("w") as out_fh:
+        writer = csv.writer(out_fh)
+        writer.writerow(["phylotype", "sv"])
+        for sv, pt in new_sv_pt.items():
+            writer.writerow([pt, sv])
 
 
 if __name__ == "__main__":

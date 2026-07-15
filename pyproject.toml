@@ -1,10 +1,10 @@
 [build-system]
-requires = ["poetry-core>=2.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "phylotypes"
-version = "2.0.0_pre1"
+version = "2.0.1"
 description = "Group phylogenetically placed sequence variants into phylotypes"
 readme = "README.md"
 authors = [
@@ -39,8 +39,9 @@ phylotypes = "phylotypes.phylotypes:main"
 add_phylotypes = "phylotypes.add_phylotypes:main"
 phylotype_taxonomy = "phylotypes.phylotype_taxonomy:main"
 
-[tool.poetry]
-packages = [{include = "phylotypes", from = "src"}]
+[tool.hatch.build.targets.wheel]
+packages = ["src/phylotypes"]
+
 [dependency-groups]
 dev = [
     "ty (>=0.0.1a1)",
@@ -118,7 +119,7 @@ ignore = [
 max-complexity = 10
 
 [tool.ruff.lint.pydocstyle]
-convention = "google"
+convention = "numpy"
 
 [tool.ruff.lint.isort]
 known-first-party = ["phylotypes"]

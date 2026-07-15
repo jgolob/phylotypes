@@ -11,32 +11,27 @@ License: MIT
 """
 
 import argparse
+from collections import defaultdict
 import csv
+from io import StringIO
 import itertools
 import json
 import logging
+from pathlib import Path
 import random
 import re
 import sys
-from collections import defaultdict
-from io import StringIO
 from typing import (
     Any,
-    Dict,
-    List,
-    Optional,
-    Set,
-    Tuple,
-    Union,
+    ClassVar,
     TextIO,
 )
 
-import numpy as np
-import torch
 from Bio import Phylo
-from sklearn.cluster import AgglomerativeClustering
+import numpy as np
 from skbio import TreeNode
-
+from sklearn.cluster import AgglomerativeClustering
+import torch
 
 # Configure logging
 root_logger = logging.getLogger()
@@ -94,7 +89,7 @@ class Phylotypes:
         Dictionary mapping node names to their index in node_names
     """
 
-    required_fields = ["fields", "placements", "tree"]
+    required_fields: ClassVar[list[str]] = ["fields", "placements", "tree"]
 
     def __init__(
         self,
@@ -138,26 +133,26 @@ class Phylotypes:
         self.max_pregroup_size: int = max_pregroup_size
 
         # Data containers
-        self.phylogroups: List[Set[str]] = []
-        self.sv_groups: List[List[str]] = []
-        self.jplace: Dict[str, Any] = {}
+        self.phylogroups: list[set[str]] = []
+        self.sv_groups: list[list[str]] = []
+        self.jplace: dict[str, Any] = {}
 
         # Tree and indexing data
-        self.tree: Optional[TreeNode] = None
+        self.tree: TreeNode | None = None
         self.edge_idx: int = 0
         self.lwr_idx: int = 0
         self.dl_idx: int = 0
-        self.sv_nodes: Dict[str, Dict[int, List[float]]] = {}
-        self.name_node: Dict[str, TreeNode] = {}
-        self.node_name: Dict[TreeNode, str] = {}
+        self.sv_nodes: dict[str, dict[int, list[float]]] = {}
+        self.name_node: dict[str, TreeNode] = {}
+        self.node_name: dict[TreeNode, str] = {}
 
         # Node indexing
-        self.node_names: List[str] = []
-        self.node_name_to_idx: Dict[str, int] = {}
+        self.node_names: list[str] = []
+        self.node_name_to_idx: dict[str, int] = {}
 
         # Groupings
-        self._pregrouped_sv: List[List[int]] = []
-        self._pregroup_lca: List[TreeNode] = []
+        self._pregrouped_sv: list[list[int]] = []
+        self._pregroup_lca: list[TreeNode] = []
 
     def load_jplace(self, jplace_fh: TextIO) -> None:
         """
@@ -238,11 +233,11 @@ class Phylotypes:
 
         try:
             # Parse tree with BioPython
-            tp = Phylo.read(StringIO(tree_norm), "newick")  # type: ignore
+            tp = Phylo.read(StringIO(tree_norm), "newick")
 
             # Convert to scikit-bio TreeNode format
             with StringIO() as th:
-                Phylo.write(tp, th, "newick")  # type: ignore
+                Phylo.write(tp, th, "newick")
                 th.seek(0)
                 self.tree = TreeNode.read(th)
         except Exception as e:
@@ -285,7 +280,7 @@ class Phylotypes:
                     self.sv_nodes[sv] = pl_nodes
 
         # And list / vector based lookups of node *names*
-        self.node_names = sorted({str(node_name) for pl in self.sv_nodes.values() for node_name in pl.keys()})
+        self.node_names = sorted({str(node_name) for pl in self.sv_nodes.values() for node_name in pl})
         self.node_name_to_idx = {name: idx for idx, name in enumerate(self.node_names)}
 
         self._build_placement_tensors()
@@ -308,7 +303,6 @@ class Phylotypes:
         placement_dl : torch.Tensor
             Tensor of shape (n_placements, num_nodes) filled with distal length of placement at nodes
         """
-
         self.placement_names = sorted(self.sv_nodes.keys())
         self.placement_idx = {n: i for i, n in enumerate(self.placement_names)}
         n_placements = len(self.placement_names)
@@ -353,7 +347,7 @@ class Phylotypes:
             depth of their lowest common ancestor. Shared across pairwise-distance
             calls and pregroups.
         """
-        self.node_depth: Dict[int, float] = {}
+        self.node_depth: dict[int, float] = {}
 
         if self.tree is None:
             self.node_depth_tensor = torch.zeros(len(self.node_names), dtype=torch.float32, device=self.device)
@@ -376,7 +370,7 @@ class Phylotypes:
         )
         self._lca_depth_cache = {}
 
-    def _lca_depth_for_nodes(self, node_idx: Tuple[int, ...]) -> float:
+    def _lca_depth_for_nodes(self, node_idx: tuple[int, ...]) -> float:
         """
         Depth of the lowest common ancestor of a set of node-column indices.
 
@@ -438,9 +432,10 @@ class Phylotypes:
 
     def pairwise_distance(
         self,
-        placement_indices: Optional[List[int]] = None,
+        placement_indices: list[int] | None = None,
+        *,
         distal_length: bool = True,
-        metric: Optional[str] = None,
+        metric: str | None = None,
     ) -> torch.Tensor:
         """
         Calculate the pairwise phylogenetic distance between placements.
@@ -470,15 +465,16 @@ class Phylotypes:
         """
         metric = metric or self.distance
         if metric == "kr":
-            return self._pairwise_kr(placement_indices, distal_length)
+            return self._pairwise_kr(placement_indices, distal_length=distal_length)
         if metric == "legacy":
-            return self._pairwise_legacy(placement_indices, distal_length)
+            return self._pairwise_legacy(placement_indices, distal_length=distal_length)
         msg = f"Unknown distance metric: {metric!r}"
         raise ValueError(msg)
 
     def _pairwise_legacy(
         self,
-        placement_indices: Optional[List[int]] = None,
+        placement_indices: list[int] | None = None,
+        *,
         distal_length: bool = True,
     ) -> torch.Tensor:
         """
@@ -558,7 +554,8 @@ class Phylotypes:
 
     def _pairwise_kr(
         self,
-        placement_indices: Optional[List[int]] = None,
+        placement_indices: list[int] | None = None,
+        *,
         distal_length: bool = True,
         batch_size: int = 64,
     ) -> torch.Tensor:
@@ -620,8 +617,8 @@ class Phylotypes:
         dl = self.placement_dl[idx].to(dtype)
         zero_vec = torch.zeros(n, dtype=dtype, device=device)
 
-        incl: Dict[int, torch.Tensor] = {}
-        phi_cols: List[torch.Tensor] = []
+        incl: dict[int, torch.Tensor] = {}
+        phi_cols: list[torch.Tensor] = []
         for node in self.tree.postorder(include_self=True):
             col = self.node_name_to_idx.get(node.name)
             own = a[:, col] if col is not None else zero_vec
@@ -661,7 +658,7 @@ class Phylotypes:
         torch.diagonal(emd).fill_(0.0)
         return emd
 
-    def _get_lca_for_group(self, group: List[int]) -> TreeNode:
+    def _get_lca_for_group(self, group: list[int]) -> TreeNode:
         """
         Get the lowest common ancestor for a group of placements.
 
@@ -675,7 +672,10 @@ class Phylotypes:
         TreeNode
             The lowest common ancestor TreeNode for the group
         """
-        return self.tree.lowest_common_ancestor(  # type: ignore
+        if self.tree is None:
+            msg = "Tree not loaded; call load_jplace first."
+            raise ValueError(msg)
+        return self.tree.lowest_common_ancestor(
             {
                 self.name_node[self.node_names[nid]]
                 for g_i in group
@@ -698,18 +698,16 @@ class Phylotypes:
         # Our holder for groups
         groups = []
         # Sort features by number of placements (ascending)
+        node_counts = self.placement_present.sum(dim=1).cpu().numpy()
         sv_to_group = [
-            v[0]
-            for v in sorted(
-                [
-                    (sv, num_nodes)
-                    for (sv, num_nodes) in zip(self.placement_names, self.placement_present.sum(dim=1).cpu().numpy())
-                ],
+            sv
+            for sv, _ in sorted(
+                zip(self.placement_names, node_counts, strict=True),
                 key=lambda v: v[1],
             )
         ]
 
-        logging.info("Grouping {} SV".format(len(sv_to_group)))
+        logging.info("Grouping %d SV", len(sv_to_group))
         while len(sv_to_group) > 0:
             seed_sv = sv_to_group.pop()
             seed_sv_idx = self.placement_idx[seed_sv]
@@ -732,9 +730,9 @@ class Phylotypes:
             groups.append(list(group_svs_idx))
 
         logging.info(
-            "Done pre-grouping SV into {} groups, of which the largest is {} items".format(
-                len(groups), max([len(svg) for svg in groups])
-            )
+            "Done pre-grouping SV into %d groups, of which the largest is %d items",
+            len(groups),
+            max(len(svg) for svg in groups),
         )
 
         # Get the LCA for each group
@@ -786,15 +784,16 @@ class Phylotypes:
                 new_sv_groups.append(merged)
 
         logging.debug(
-            "Now {} groups, with the largest {} items".format(
-                len(new_sv_groups), max([len(svg) for svg in new_sv_groups])
-            )
+            "Now %d groups, with the largest %d items",
+            len(new_sv_groups),
+            max(len(svg) for svg in new_sv_groups),
         )
         self._pregrouped_sv = new_sv_groups
         self._pregroup_lca = [self._get_lca_for_group(grp) for grp in new_sv_groups]
 
     def generate_phylotypes(
         self,
+        *,
         distal_length: bool = True,
     ) -> None:
         """
@@ -834,7 +833,7 @@ class Phylotypes:
                 logging.debug("Group %d of %d", g_i, len(self._pregrouped_sv))
 
             if len(g_sv) == 1:
-                self.phylogroups.append(set([self.placement_names[g_sv[0]]]))
+                self.phylogroups.append({self.placement_names[g_sv[0]]})
                 continue
             # Implict else, this isn't a singleton group.
             # Calculate pairwise phylogenetic distances within group
@@ -849,7 +848,7 @@ class Phylotypes:
 
             # Map clusters to feature sets
             g_phylotype_svs = defaultdict(set)
-            for sv, cl in zip(g_sv, g_sv_clusters):
+            for sv, cl in zip(g_sv, g_sv_clusters, strict=True):
                 g_phylotype_svs[cl].add(sv)
 
             # Add clusters to phylogroups
@@ -857,19 +856,19 @@ class Phylotypes:
                 [{self.placement_names[sv_i] for sv_i in phylotype_svs} for phylotype_svs in g_phylotype_svs.values()]
             )
 
-    def _sv_edges(self, sv_idx: int) -> Set[int]:
+    def _sv_edges(self, sv_idx: int) -> set[int]:
         """Tree-edge (node-column) indices on which placement `sv_idx` has any weight."""
         return set(self.placement_present[sv_idx].nonzero(as_tuple=True)[0].tolist())
 
-    def _group_edges(self, members: List[int]) -> Set[int]:
+    def _group_edges(self, members: list[int]) -> set[int]:
         """Union of tree-edge (node-column) indices used by any placement in `members`."""
         return set(self.placement_present[members].any(dim=0).nonzero(as_tuple=True)[0].tolist())
 
     def _apply_sv(
         self,
         sv: int,
-        pool: List[Dict[str, Any]],
-        edge_index: Dict[int, Set[int]],
+        pool: list[dict[str, Any]],
+        edge_index: dict[int, set[int]],
         *,
         distal_length: bool,
         sample_size: int = 10,
@@ -908,7 +907,7 @@ class Phylotypes:
             True if `sv` was assigned to a phylotype, False if it is an orphan.
         """
         sv_edges = self._sv_edges(sv)
-        candidates: Set[int] = set()
+        candidates: set[int] = set()
         for edge in sv_edges:
             candidates.update(edge_index.get(edge, ()))
 
@@ -918,7 +917,7 @@ class Phylotypes:
         if len(candidates) == 1:
             pt_i = next(iter(candidates))
         else:
-            best: Optional[Tuple[float, int]] = None
+            best: tuple[float, int] | None = None
             for cand in candidates:
                 members = pool[cand]["members"]
                 sample = members if len(members) <= sample_size else random.sample(members, sample_size)
@@ -939,6 +938,7 @@ class Phylotypes:
 
     def generate_phylotypes_incremental(
         self,
+        *,
         distal_length: bool = True,
         seed_size: int = 200,
         expand_batch_size: int = 200,
@@ -996,7 +996,7 @@ class Phylotypes:
         remaining = order[seed_size:]
 
         # ---- Stage A: SEED ----
-        pool: List[Dict[str, Any]] = []
+        pool: list[dict[str, Any]] = []
         if len(seed_idx) == 1:
             pool.append({"members": [seed_idx[0]], "edges": self._sv_edges(seed_idx[0])})
         elif len(seed_idx) > 1:
@@ -1007,20 +1007,20 @@ class Phylotypes:
                 metric="precomputed",
                 linkage="average",
             ).fit_predict(seed_dist.cpu().numpy())
-            seed_groups: Dict[int, List[int]] = defaultdict(list)
+            seed_groups: dict[int, list[int]] = defaultdict(list)
             for local_i, cl in enumerate(seed_clusters):
                 seed_groups[cl].append(seed_idx[local_i])
             for members in seed_groups.values():
                 pool.append({"members": members, "edges": self._group_edges(members)})
 
         # ---- Stage B: edge -> phylotype inverted index ----
-        edge_index: Dict[int, Set[int]] = defaultdict(set)
+        edge_index: dict[int, set[int]] = defaultdict(set)
         for pt_i, pt in enumerate(pool):
             for edge in pt["edges"]:
                 edge_index[edge].add(pt_i)
 
         # ---- Stage C: APPLY (stream the rest) ----
-        orphans: List[int] = [
+        orphans: list[int] = [
             sv for sv in remaining if not self._apply_sv(sv, pool, edge_index, distal_length=distal_length)
         ]
 
@@ -1037,7 +1037,7 @@ class Phylotypes:
                     metric="precomputed",
                     linkage="average",
                 ).fit_predict(batch_dist.cpu().numpy())
-                batch_groups: Dict[int, List[int]] = defaultdict(list)
+                batch_groups: dict[int, list[int]] = defaultdict(list)
                 for local_i, cl in enumerate(batch_clusters):
                     batch_groups[cl].append(batch[local_i])
                 new_groups = list(batch_groups.values())
@@ -1066,7 +1066,7 @@ class Phylotypes:
                 metric="precomputed",
                 linkage="average",
             ).fit_predict(lca_mat)
-            merged: Dict[int, List[int]] = defaultdict(list)
+            merged: dict[int, list[int]] = defaultdict(list)
             for pt_i, cl in enumerate(rep_clusters):
                 merged[cl].extend(pool[pt_i]["members"])
             final_groups = list(merged.values())
@@ -1075,7 +1075,7 @@ class Phylotypes:
 
         self.phylogroups.extend({self.placement_names[sv_i] for sv_i in members} for members in final_groups)
 
-    def to_long(self) -> List[Tuple[str, str]]:
+    def to_long(self) -> list[tuple[str, str]]:
         """
         Convert phylogroups to long format for output.
 
@@ -1093,14 +1093,11 @@ class Phylotypes:
             key=lambda pgc: -1 * pgc[1],
         )
 
-        # Convert to long format
-        pg_sv_long = [
-            ("pt__{:05d}".format(pg_i + 1), sv)
+        return [
+            (f"pt__{pg_i + 1:05d}", sv)
             for pg_i, (pg_idx, pg_size) in enumerate(pg_size)
             for sv in self.phylogroups[pg_idx]
         ]
-
-        return pg_sv_long
 
     def to_csv(self, out_h: TextIO) -> None:
         """
@@ -1130,15 +1127,10 @@ class Phylotypes:
 
 def main() -> None:
     """
-    Main entry point for command-line interface.
+    Run the phylotypes command-line interface.
 
-    Parses command-line arguments, loads JPLACE data, performs phylotype
-    clustering, and outputs results to CSV file.
-
-    Notes
-    -----
-    This function handles the complete workflow from command line arguments
-    to final output generation.
+    Parse command-line arguments, load JPLACE data, perform phylotype
+    clustering, and write results to a CSV file.
     """
     args_parser = argparse.ArgumentParser(
         description="""Given a JPLACE file of placed features on a phylogenetic tree,
@@ -1149,7 +1141,7 @@ def main() -> None:
         "--jplace",
         "-J",
         help="JPLACE file, as created by pplacer or epa-ng",
-        type=argparse.FileType("r"),
+        type=Path,
         required=True,
     )
 
@@ -1157,7 +1149,7 @@ def main() -> None:
         "--out",
         "-O",
         help="Where to place the phylogroups (in csv long format)?",
-        type=argparse.FileType("wt"),
+        type=Path,
         required=True,
     )
 
@@ -1247,7 +1239,8 @@ def main() -> None:
         max_pregroup_size=args.max_pregroup_size,
     )
     try:
-        phylotypes.load_jplace(args.jplace)
+        with args.jplace.open() as jplace_fh:
+            phylotypes.load_jplace(jplace_fh)
     except ValueError as e:
         logging.error(e)
         sys.exit(1)
@@ -1260,5 +1253,6 @@ def main() -> None:
         phylotypes.generate_phylotypes()
 
     logging.info("Done Phylogrouping. Outputting.")
-    phylotypes.to_csv(args.out)
+    with args.out.open("w") as out_fh:
+        phylotypes.to_csv(out_fh)
     logging.info("DONE!")
