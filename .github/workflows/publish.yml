@@ -1,0 +1,42 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  test:
+    name: Test & lint before publish
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Build and publish to PyPI
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for OIDC Trusted Publishing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Assert tag matches pyproject.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="v$(uv run python -c 'import tomllib; d=tomllib.load(open("pyproject.toml","rb")); print(d["project"]["version"])')"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "Tag $TAG does not match pyproject.toml version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build package
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
