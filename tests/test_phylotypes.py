@@ -29,10 +29,8 @@ def _legacy_loop_reference(p: Phylotypes, idx, *, distal_length: bool = True) ->
     out = torch.zeros((n, n))
     for i in range(n):
         for j in range(i + 1, n):
-            pa = {k: (v[p.lwr_idx], v[p.dl_idx] if distal_length else 0.0)
-                  for k, v in p.sv_nodes[names[i]].items()}
-            pb = {k: (v[p.lwr_idx], v[p.dl_idx] if distal_length else 0.0)
-                  for k, v in p.sv_nodes[names[j]].items()}
+            pa = {k: (v[p.lwr_idx], v[p.dl_idx] if distal_length else 0.0) for k, v in p.sv_nodes[names[i]].items()}
+            pb = {k: (v[p.lwr_idx], v[p.dl_idx] if distal_length else 0.0) for k, v in p.sv_nodes[names[j]].items()}
             wa = sum(v[0] for v in pa.values())
             wb = sum(v[0] for v in pb.values())
             d = 0.0
@@ -41,10 +39,10 @@ def _legacy_loop_reference(p: Phylotypes, idx, *, distal_length: bool = True) ->
             distant = (set(pa) | set(pb)) - overlap
             if distant:
                 lca = p.tree.lowest_common_ancestor([p.name_node[str(k)] for k in distant])
-                d += (sum((v[1] + lca.distance(p.name_node[str(k)])) * v[0]
-                          for k, v in pa.items() if k in distant) / wa
-                    + sum((v[1] + lca.distance(p.name_node[str(k)])) * v[0]
-                          for k, v in pb.items() if k in distant) / wb)
+                d += (
+                    sum((v[1] + lca.distance(p.name_node[str(k)])) * v[0] for k, v in pa.items() if k in distant) / wa
+                    + sum((v[1] + lca.distance(p.name_node[str(k)])) * v[0] for k, v in pb.items() if k in distant) / wb
+                )
             out[i, j] = out[j, i] = d
     return out
 
@@ -75,16 +73,18 @@ def test_kr_is_a_metric_and_matches_expected():
     """KR (true tree-Wasserstein): validated values + metric axioms."""
     p = _load("kr")
     emd = p.pairwise_distance([0, 1, 2, 3], metric="kr")
-    expected = torch.tensor([
-        [0.000, 0.100, 0.500, 0.508],
-        [0.100, 0.000, 0.500, 0.508],
-        [0.500, 0.500, 0.000, 0.068],
-        [0.508, 0.508, 0.068, 0.000],
-    ])
+    expected = torch.tensor(
+        [
+            [0.000, 0.100, 0.500, 0.508],
+            [0.100, 0.000, 0.500, 0.508],
+            [0.500, 0.500, 0.000, 0.068],
+            [0.508, 0.508, 0.068, 0.000],
+        ]
+    )
     assert torch.allclose(emd, expected, atol=1e-3), emd
-    assert torch.allclose(emd, emd.t(), atol=1e-6)        # symmetric
-    assert bool((torch.diagonal(emd) == 0).all())         # zero diagonal
-    for a in range(4):                                    # triangle inequality
+    assert torch.allclose(emd, emd.t(), atol=1e-6)  # symmetric
+    assert bool((torch.diagonal(emd) == 0).all())  # zero diagonal
+    for a in range(4):  # triangle inequality
         for b in range(4):
             for c in range(4):
                 assert emd[a, b] <= emd[a, c] + emd[c, b] + 1e-5
@@ -100,10 +100,25 @@ def test_generate_phylotypes_partitions_all_svs():
 
 def test_missing_tree_raises():
     p = Phylotypes()
-    bad = io.StringIO(json.dumps({"fields": ["edge_num", "like_weight_ratio",
-                                              "distal_length"], "placements": []}))
+    bad = io.StringIO(json.dumps({"fields": ["edge_num", "like_weight_ratio", "distal_length"], "placements": []}))
     with pytest.raises(ValueError):
         p.load_jplace(bad)
+
+
+def test_load_jplace_handles_unnamed_nodes():
+    """EPA-ng trees leave some nodes unnamed (e.g. the root carries no {edge_num}).
+    The node-name cleanup must skip those rather than crash on node.name.replace()."""
+    tree = "((A:0.1{0},B:0.1{1}):0.2{2},(C:0.1{3},D:0.1{4}):0.2{5});"
+    jplace = {
+        "version": 3,
+        "tree": tree,
+        "fields": ["edge_num", "like_weight_ratio", "distal_length"],
+        "placements": [{"p": [[0, 1.0, 0.05]], "n": ["sv1"]}],
+        "metadata": {},
+    }
+    p = Phylotypes()
+    p.load_jplace(io.StringIO(json.dumps(jplace)))
+    assert "sv1" in p.sv_nodes
 
 
 def test_max_pregroup_size_splits_oversized_pregroups():
@@ -159,11 +174,7 @@ def _make_star_jplace(n_leaves: int = 20, svs_per_leaf: int = 15) -> dict:
 
 def _pairs_sharing_a_group(phylogroups):
     sv_to_group = {sv: gi for gi, grp in enumerate(phylogroups) for sv in grp}
-    return {
-        (a, b)
-        for a, b in itertools.combinations(sorted(sv_to_group), 2)
-        if sv_to_group[a] == sv_to_group[b]
-    }
+    return {(a, b) for a, b in itertools.combinations(sorted(sv_to_group), 2) if sv_to_group[a] == sv_to_group[b]}
 
 
 def test_incremental_close_to_batch_on_synthetic_data():
