@@ -14,6 +14,7 @@ import argparse
 from collections import defaultdict
 from collections.abc import Callable
 import csv
+import heapq
 from io import StringIO
 import itertools
 import json
@@ -137,7 +138,8 @@ class Phylotypes:
         self.distance: str = distance
         self.device: torch.device = torch.device(device)
         self.max_pregroup_size: int = max_pregroup_size
-        self._rng: random.Random = random.Random(random_state) if random_state is not None else random.Random()
+        # Clustering samples require reproducibility, not cryptographic randomness.
+        self._rng: random.Random = random.Random(random_state) if random_state is not None else random.Random()  # noqa: S311
 
         # Data containers
         self.phylogroups: list[set[str]] = []
@@ -322,7 +324,7 @@ class Phylotypes:
         )
 
         logging.info(
-            "Building placement tensors (%d × %d)",
+            "Building placement tensors (%d x %d)",
             len(self.sv_nodes),
             len(self.node_names),
         )
@@ -810,14 +812,19 @@ class Phylotypes:
         # From a computational perpective we are better off with *more* *smaller* clusters
         # But alas...
 
-        # Cluster groups by phylogenetic distance
-        logging.info("Clustering groups by phylogenetic distance")
-        g_lca_clusters = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=self.pd_threshold,
-            metric="precomputed",
-            linkage="average",
-        ).fit_predict(g_lca_mat)
+        # ``AgglomerativeClustering`` requires at least two samples.  A single
+        # LWR pregroup is already the complete pregrouping result.
+        if len(groups) == 1:
+            g_lca_clusters = np.zeros(1, dtype=int)
+        else:
+            # Cluster groups by phylogenetic distance
+            logging.info("Clustering groups by phylogenetic distance")
+            g_lca_clusters = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=self.pd_threshold,
+                metric="precomputed",
+                linkage="average",
+            ).fit_predict(g_lca_mat)
 
         # Regroup SVs based on group clusters
         logging.info("Regrouping SV based on group-clusters")
@@ -892,7 +899,7 @@ class Phylotypes:
                 continue
             # Implict else, this isn't a singleton group.
             # Calculate pairwise phylogenetic distances within group
-            g_sv_dist_mat = self.pairwise_distance(g_sv)
+            g_sv_dist_mat = self.pairwise_distance(g_sv, distal_length=distal_length)
             # Cluster features by phylogenetic distance
             g_sv_clusters = AgglomerativeClustering(
                 n_clusters=None,
@@ -1012,7 +1019,7 @@ class Phylotypes:
             sample = members if len(members) <= sample_size else self._rng.sample(members, sample_size)
             dist = self.pairwise_distance([sv, *sample], distal_length=distal_length)
             mean_dist = float(dist[0, 1:].mean())
-            if mean_dist > self.pd_threshold:
+            if mean_dist >= self.pd_threshold:
                 return False
         else:
             best: tuple[float, int] | None = None
@@ -1023,7 +1030,7 @@ class Phylotypes:
                 mean_dist = float(dist[0, 1:].mean())
                 if best is None or mean_dist < best[0]:
                     best = (mean_dist, cand)
-            if best is None or best[0] > self.pd_threshold:
+            if best is None or best[0] >= self.pd_threshold:
                 return False
             pt_i = best[1]
 
@@ -1043,27 +1050,17 @@ class Phylotypes:
         min_lwr: float = 0.0,
         chunk_size: int = 1000,
     ) -> list[int]:
-        """Assign multiple SVs to existing phylotypes, batching distance queries.
+        """Assign multiple SVs to existing phylotypes in streaming order.
 
-        SVs are processed in chunks of ``chunk_size``.  Within each chunk,
-        single-candidate SVs sharing the same candidate are evaluated in one
-        distance-matrix call, amortising tensor-allocation and Python-dispatch
-        overhead.  Edges from assigned SVs are accumulated into ``pool`` and
-        ``edge_index`` between chunks so subsequent chunks see the grown
-        phylotype footprints.  Multi-candidate and zero-candidate SVs within a
-        chunk are handled individually via ``_apply_sv``.
+        Each SV is evaluated after every earlier accepted SV has updated both
+        the candidate edge index and the candidate's membership.  This is
+        necessary for average-distance gating: accepting a batch against the
+        membership at the start of the batch can admit placements whose mean
+        distance from the grown group exceeds ``pd_threshold``.
 
-        Setting ``chunk_size=1`` reproduces the original per-SV streaming
-        semantics exactly (each assignment grows the edge index before the next
-        SV is considered). Zero-candidate SVs are recorded immediately as
-        orphans; only multi-candidate SVs continue through ``_apply_sv``.
-
-        Design note — sampling
-        ~~~~~~~~~~~~~~~~~~~~~~
-        Phase 2 draws **one** member sample per phylotype per chunk, whereas
-        ``_apply_sv`` draws one per SV.  This lowers variance but correlates
-        accept/reject decisions for all SVs in a chunk sharing the same
-        candidate.  The effect is bounded by ``chunk_size``.
+        ``chunk_size`` remains an API compatibility parameter.  It controls
+        only the outer iteration, not assignment visibility; every assignment
+        is immediately visible to the next one.
 
         Parameters
         ----------
@@ -1072,8 +1069,8 @@ class Phylotypes:
         pool, edge_index, distal_length, sample_size, min_lwr
             Same semantics as :meth:`_apply_sv`.
         chunk_size : int, optional
-            Number of SVs to classify and batch-evaluate before accumulating
-            edges.  ``1`` restores fully sequential streaming (default: 1000).
+            Compatibility-only outer iteration size; every assignment is applied
+            sequentially regardless of this value (default: 1000).
 
         Returns
         -------
@@ -1083,52 +1080,11 @@ class Phylotypes:
         orphans: list[int] = []
 
         for chunk_start in range(0, len(svs), chunk_size):
-            chunk = svs[chunk_start : chunk_start + chunk_size]
-
-            # ---- Classify SVs by candidate count ----
-            # Retain the min_lwr-filtered edge set so we don't recompute it.
-            single_groups: dict[int, list[int]] = defaultdict(list)
-            multi_svs: list[int] = []
-            chunk_edges: dict[int, set[int]] = {}
-
-            for sv in chunk:
-                sv_edges = self._sv_edges(sv, min_lwr=min_lwr)
-                chunk_edges[sv] = sv_edges
-                candidates: set[int] = set()
-                for edge in sv_edges:
-                    candidates.update(edge_index.get(edge, ()))
-                if len(candidates) == 0:
-                    # Proven orphan — no candidates exist.
-                    orphans.append(sv)
-                elif len(candidates) == 1:
-                    single_groups[next(iter(candidates))].append(sv)
-                else:
-                    multi_svs.append(sv)
-
-            # ---- Batched single-candidate evaluation ----
-            for pt_i, sv_batch in single_groups.items():
-                members = pool[pt_i]["members"]
-                sample = (
-                    members
-                    if len(members) <= sample_size
-                    else self._rng.sample(members, sample_size)
-                )
-                ns = len(sample)
-                all_indices = [*sample, *sv_batch]
-                dist = self.pairwise_distance(all_indices, distal_length=distal_length)
-                sv_dists = dist[ns:, :ns].mean(dim=1)
-
-                for k, sv in enumerate(sv_batch):
-                    if float(sv_dists[k]) <= self.pd_threshold:
-                        sv_edges_full = chunk_edges[sv] if min_lwr == 0.0 else self._sv_edges(sv)
-                        self._attach_sv(sv, pt_i, sv_edges_full, pool, edge_index)
-                    else:
-                        orphans.append(sv)
-
-            # ---- Multi-candidate SVs (sequential, accumulates naturally) ----
-            for sv in multi_svs:
+            for sv in svs[chunk_start : chunk_start + chunk_size]:
                 if not self._apply_sv(
-                    sv, pool, edge_index,
+                    sv,
+                    pool,
+                    edge_index,
                     distal_length=distal_length,
                     sample_size=sample_size,
                     min_lwr=min_lwr,
@@ -1165,11 +1121,14 @@ class Phylotypes:
         distal_length: bool = True,
         sample_size: int = 10,
     ) -> list[list[int]]:
-        """Merge close groups using sampled inter-group distance.
+        """Merge close groups using sampled, size-weighted average linkage.
 
         For each pair of groups, samples up to ``sample_size`` members from
         each, computes the mean pairwise distance between the two samples,
-        and builds a distance matrix for AgglomerativeClustering.
+        and builds initial inter-group distances.  The merge updates then use
+        the number of SVs in each group as the average-linkage weight.  Treating
+        every preliminary group as one observation would overweight singleton
+        groups and can produce a different cut from SV-level average linkage.
 
         Parameters
         ----------
@@ -1189,10 +1148,7 @@ class Phylotypes:
             return groups
 
         # Pre-sample deterministically before the O(K^2) loop.
-        samples = [
-            g if len(g) <= sample_size else self._rng.sample(g, sample_size)
-            for g in groups
-        ]
+        samples = [g if len(g) <= sample_size else self._rng.sample(g, sample_size) for g in groups]
 
         k = len(groups)
         reconcile_mat = np.zeros((k, k), dtype=np.float64)
@@ -1200,23 +1156,53 @@ class Phylotypes:
             for j in range(i + 1, k):
                 si, sj = samples[i], samples[j]
                 dist = self.pairwise_distance(
-                    [*si, *sj], distal_length=distal_length,
+                    [*si, *sj],
+                    distal_length=distal_length,
                 )
                 ni = len(si)
                 d = float(dist[:ni, ni:].mean())
                 reconcile_mat[i, j] = d
                 reconcile_mat[j, i] = d
 
-        labels = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=self.pd_threshold,
-            metric="precomputed",
-            linkage="average",
-        ).fit_predict(reconcile_mat)
-        merged: dict[int, list[int]] = defaultdict(list)
-        for idx, cl in enumerate(labels):
-            merged[cl].extend(groups[idx])
-        return list(merged.values())
+        # Perform UPGMA directly so subsequent merge distances are weighted by
+        # the SV counts represented by the two groups.  sklearn's precomputed
+        # agglomeration considers each *input group* a single observation and
+        # therefore cannot preserve those weights.
+        active = set(range(k))
+        members = {i: list(group) for i, group in enumerate(groups)}
+        weights = {i: len(group) for i, group in enumerate(groups)}
+        # Stale entries are filtered by the ``active`` set check; no explicit cleanup needed.
+        distances = {(i, j): float(reconcile_mat[i, j]) for i in range(k) for j in range(i + 1, k)}
+        queue = [(distance, i, j) for (i, j), distance in distances.items()]
+        heapq.heapify(queue)
+        next_id = k
+
+        while queue:
+            distance, left, right = heapq.heappop(queue)
+            if left not in active or right not in active:
+                continue
+            if distance >= self.pd_threshold:
+                break
+
+            merged_id = next_id
+            next_id += 1
+            members[merged_id] = [*members.pop(left), *members.pop(right)]
+            weights[merged_id] = weights[left] + weights[right]
+            active.remove(left)
+            active.remove(right)
+
+            for other in active:
+                left_key = (left, other) if left < other else (other, left)
+                right_key = (right, other) if right < other else (other, right)
+                w_left = weights[left] * distances[left_key]
+                w_right = weights[right] * distances[right_key]
+                updated = (w_left + w_right) / weights[merged_id]
+                key = (merged_id, other) if merged_id < other else (other, merged_id)
+                distances[key] = updated
+                heapq.heappush(queue, (updated, *key))
+            active.add(merged_id)
+
+        return [members[group_id] for group_id in sorted(active)]
 
     def generate_phylotypes_incremental(
         self,
@@ -1235,7 +1221,7 @@ class Phylotypes:
         O(n^2) distance matrix and clustering pass. Builds an initial phylotype pool
         from a small "seed" of the most specific placements (Stage A), indexes each
         phylotype by the tree edges its members are placed on (Stage B), assigns the
-        remaining placements in chunks via batched distance queries (Stage C),
+        remaining placements in streaming order (Stage C),
         clusters and absorbs orphans into new phylotypes (Stage D), and finally
         merges close phylotypes using sampled inter-phylotype distance (Stage E).
 
@@ -1247,18 +1233,17 @@ class Phylotypes:
         phylotype's members -- behavior closer to single/centroid linkage. Near
         phylotype boundaries, some placements may therefore be grouped differently
         than they would be by the batch path. This is an accepted, explicit
-        trade-off in exchange for bounded (`O(K*m + seed_size^2 + expand_batch_size^2)`)
-        memory instead of `O(n^2)`.
+        trade-off in exchange for avoiding a full SV-by-SV distance matrix in
+        the SEED and EXPAND stages. RECONCILE still requires a dense matrix of
+        the current phylotype pool, so its memory use is quadratic in the
+        number of provisional phylotypes.
 
-        Stage C processes SVs in chunks of ``apply_chunk_size``.  Within each
-        chunk, single-candidate SVs sharing the same candidate are evaluated in
-        one distance-matrix call, amortising Python-dispatch overhead.  Edges
-        from assigned SVs accumulate between chunks so subsequent chunks see the
-        grown phylotype footprints.  ``apply_chunk_size=1`` reproduces the
-        original per-SV streaming semantics exactly. APPLY draws one member
-        sample per phylotype per chunk, and RECONCILE draws one sample per
-        phylotype rather than per pair. This lowers sampling variance while
-        correlating the decisions that reuse each sample.
+        Every APPLY decision observes the members and edge index created by all
+        earlier accepted SVs. ``apply_chunk_size`` is retained for command-line
+        and API compatibility, but it no longer changes assignment behavior.
+        RECONCILE draws one sample per phylotype rather than per pair; this
+        reduces sampling variance while retaining a sampled estimate for large
+        groups.
 
         Parameters
         ----------
@@ -1279,9 +1264,9 @@ class Phylotypes:
             Number of members to sample per candidate phylotype when comparing
             distances during APPLY, EXPAND, and RECONCILE stages (default: 10).
         apply_chunk_size : int, optional
-            Number of SVs to batch-classify before accumulating edges in Stage C
-            and Stage D re-application passes. ``1`` restores fully sequential
-            streaming (default: 1000).
+            Compatibility-only outer iteration size for Stage C and Stage D
+            re-application passes. Assignments are always applied sequentially,
+            so this value does not change grouping (default: 1000).
 
         Raises
         ------
@@ -1296,6 +1281,15 @@ class Phylotypes:
             raise ValueError(msg)
         if apply_chunk_size < 1:
             msg = "apply_chunk_size must be at least 1"
+            raise ValueError(msg)
+        if seed_size < 1:
+            msg = "seed_size must be at least 1"
+            raise ValueError(msg)
+        if expand_batch_size < 1:
+            msg = "expand_batch_size must be at least 1"
+            raise ValueError(msg)
+        if sample_size < 1:
+            msg = "sample_size must be at least 1"
             raise ValueError(msg)
 
         # Most specific placements (fewest placement nodes) first.
@@ -1335,14 +1329,16 @@ class Phylotypes:
             for edge in pt["edges"]:
                 edge_index[edge].add(pt_i)
 
-        # ---- Stage C: APPLY (chunked batching) ----
+        # ---- Stage C: APPLY ----
         logging.info(
             "Incremental Stage C (APPLY): assigning %d remaining placements (chunk_size=%d)",
             len(remaining),
             apply_chunk_size,
         )
         orphans = self._apply_svs_batched(
-            remaining, pool, edge_index,
+            remaining,
+            pool,
+            edge_index,
             distal_length=distal_length,
             sample_size=sample_size,
             min_lwr=min_lwr,
@@ -1388,7 +1384,9 @@ class Phylotypes:
                     edge_index[edge].add(pt_i)
 
             orphans = self._apply_svs_batched(
-                orphans, pool, edge_index,
+                orphans,
+                pool,
+                edge_index,
                 distal_length=distal_length,
                 sample_size=sample_size,
                 min_lwr=min_lwr,
@@ -1543,7 +1541,8 @@ def main() -> None:
         "--incremental",
         help="Use the incremental seed->apply->expand->reconcile clustering path "
         "instead of the batch path. Scales to larger inputs at the cost of an "
-        "approximate (single/centroid-like) linkage near phylotype boundaries. "
+        "approximate, order-dependent linkage near phylotype boundaries; it does "
+        "not enforce batch LWR-pregroup partitions. "
         "(Default: False).",
         action="store_true",
     )
@@ -1592,8 +1591,8 @@ def main() -> None:
 
     args_parser.add_argument(
         "--apply-chunk-size",
-        help="Number of SVs to batch-classify before accumulating edges during "
-        "--incremental APPLY passes. 1 restores per-SV streaming semantics. "
+        help="Compatibility-only outer iteration size for --incremental APPLY passes. "
+        "Assignments are always applied sequentially, so it does not change grouping. "
         "(Default: 1000).",
         default=1000,
         type=int,
@@ -1617,6 +1616,7 @@ def main() -> None:
         sys.exit(1)
     if args.incremental:
         phylotypes.generate_phylotypes_incremental(
+            distal_length=not args.no_distal_length,
             seed_size=args.seed_size,
             expand_batch_size=args.expand_batch_size,
             min_lwr=args.min_lwr,
@@ -1624,7 +1624,7 @@ def main() -> None:
             apply_chunk_size=args.apply_chunk_size,
         )
     else:
-        phylotypes.generate_phylotypes()
+        phylotypes.generate_phylotypes(distal_length=not args.no_distal_length)
 
     logging.info("Done Phylogrouping. Outputting.")
     with args.out.open("w") as out_fh:

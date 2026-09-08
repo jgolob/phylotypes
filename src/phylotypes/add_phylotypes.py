@@ -121,6 +121,15 @@ def build_combined(
 
     previous_names = _placement_names(previous)
     new_names = _placement_names(new)
+    duplicate_names = previous_names & new_names
+    if duplicate_names:
+        examples = ", ".join(sorted(duplicate_names)[:5])
+        suffix = "..." if len(duplicate_names) > 5 else ""
+        msg = (
+            "Previous and new jplace reuse SV name(s): "
+            f"{examples}{suffix}. SV names must be disjoint so new placements cannot overwrite existing members."
+        )
+        raise ValueError(msg)
 
     merged = {
         "fields": previous["fields"],
@@ -190,7 +199,8 @@ def assign_new_svs(
         A mapping of assigned new SV name to phylotype id, and the set of
         orphaned new SV names (no overlapping phylotype, or beyond threshold).
     """
-    rng = random.Random(random_state) if random_state is not None else random.Random()
+    # Assignment sampling requires reproducibility, not cryptographic randomness.
+    rng = random.Random(random_state) if random_state is not None else random.Random()  # noqa: S311
 
     # Build per-phylotype edge sets from existing members.  These use ALL
     # edges (no min_lwr filter) because the existing phylotype composition
@@ -216,10 +226,7 @@ def assign_new_svs(
 
     for new_sv in sorted(new_names):
         if min_lwr > 0.0:
-            new_edges = {
-                edge for edge, data in combined.sv_nodes[new_sv].items()
-                if data[lwr_idx] > min_lwr
-            }
+            new_edges = {edge for edge, data in combined.sv_nodes[new_sv].items() if data[lwr_idx] > min_lwr}
         else:
             new_edges = set(combined.sv_nodes[new_sv].keys())
         candidates = [pt for pt, edges in pt_edges.items() if edges & new_edges]
@@ -523,8 +530,7 @@ def main() -> None:
     orphan_pt: dict[str, str] = {}
     if orphans:
         logging.warning(
-            "Could not add %d of %d sequence variants (no overlapping phylotype"
-            " or beyond pd_threshold).",
+            "Could not add %d of %d sequence variants (no overlapping phylotype or beyond pd_threshold).",
             len(orphans),
             total,
         )

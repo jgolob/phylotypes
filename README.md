@@ -21,11 +21,13 @@ This is particularly useful when attempting a metanalysis of 16s rRNA gene varia
 
 `--no-distal-length` Ignore distal length to nodes when computing distances. Default is `False` (distal length is included).
 
-`--incremental` Use an incremental seed→apply→expand→reconcile clustering path instead of the default batch path. Scales to larger inputs with lower peak memory at the cost of approximate (single/centroid-like) linkage near phylotype boundaries.
+`--incremental` Use an incremental seed→apply→expand→reconcile clustering path instead of the default batch path. Scales to larger inputs with lower peak memory at the cost of approximate, order-dependent grouping near phylotype boundaries. It also does not enforce the batch path's LWR-pregroup partitions, so its results are not expected to reproduce batch mode exactly.
 
 `--seed-size <int>` Number of (most specific) placements used to seed the initial phylotype pool when `--incremental` is set. Default: `200`.
 
 `--expand-batch-size <int>` Maximum number of orphaned placements clustered together per expand pass when `--incremental` is set. Default: `200`.
+
+`--apply-chunk-size <int>` Retained for compatibility. Incremental assignments are applied sequentially, so this setting does not change grouping. Default: `1000`.
 
 `--device <str>` PyTorch device for tensor computations, e.g. `cpu` or `cuda`. Default: `cpu`.
 

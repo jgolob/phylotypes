@@ -24,6 +24,7 @@ def _legacy_loop_reference(p: Phylotypes, idx, *, distal_length: bool = True) ->
     """Ground truth for the ORIGINAL metric: a faithful per-pair loop, mirroring
     add_phylotypes.placement_pairwise_distance. The vectorized `_pairwise_legacy`
     must reproduce this to float precision."""
+    assert p.tree is not None
     names = [p.placement_names[i] for i in idx]
     n = len(names)
     out = torch.zeros((n, n))
@@ -148,6 +149,89 @@ def test_generate_phylotypes_incremental_partitions_all_svs():
         assert grouped == {"sv1", "sv2", "sv3", "sv4"}, metric
 
 
+def _simple_jplace(tree: str, rows: list[tuple[str, int, float]]) -> dict:
+    """Build a one-placement-per-SV JPLACE fixture for grouping regressions."""
+    return {
+        "version": 3,
+        "tree": tree,
+        "fields": ["edge_num", "like_weight_ratio", "distal_length"],
+        "placements": [{"n": [name], "p": [[edge, 1.0, distal_length]]} for name, edge, distal_length in rows],
+        "metadata": {},
+    }
+
+
+def test_batch_handles_a_single_lwr_pregroup():
+    """A single pregroup must bypass sklearn's two-sample requirement."""
+    p = Phylotypes()
+    p.load_jplace_dict(_simple_jplace("(A:1.0{0}):0.0{1};", [("a", 0, 0.0), ("b", 0, 0.0)]))
+    p.generate_phylotypes()
+    assert p.phylogroups == [{"a", "b"}]
+
+
+def test_batch_and_incremental_honor_no_distal_length():
+    """The public APIs must make the same distal-length decision."""
+    jplace = _simple_jplace(
+        "(A:3.0{0},B:10.0{1}):0.0{2};",
+        [("a", 0, 0.8), ("b", 0, 0.8), ("far", 1, 0.0)],
+    )
+    results = []
+    for incremental in (False, True):
+        p = Phylotypes(pd_threshold=1.0, distance="legacy", random_state=1)
+        p.load_jplace_dict(jplace)
+        if incremental:
+            p.generate_phylotypes_incremental(seed_size=1, distal_length=False)
+        else:
+            p.generate_phylotypes(distal_length=False)
+        results.append(sorted(sorted(group) for group in p.phylogroups))
+    assert results[0] == results[1] == [["a", "b"], ["far"]]
+
+
+def test_incremental_threshold_boundary_matches_batch():
+    """APPLY must use the same strict threshold cut as average linkage."""
+    jplace = _simple_jplace(
+        "(A:3.0{0},B:10.0{1}):0.0{2};",
+        [("a", 0, 0.0), ("b", 0, 1.0), ("far", 1, 0.0)],
+    )
+    results = []
+    for incremental in (False, True):
+        p = Phylotypes(pd_threshold=1.0, distance="kr", random_state=1)
+        p.load_jplace_dict(jplace)
+        if incremental:
+            p.generate_phylotypes_incremental(seed_size=1)
+        else:
+            p.generate_phylotypes()
+        results.append(sorted(sorted(group) for group in p.phylogroups))
+    assert results[0] == results[1] == [["a"], ["b"], ["far"]]
+
+
+def test_incremental_apply_chunk_size_does_not_change_grouping():
+    """Each APPLY decision must see members accepted earlier in the same chunk."""
+    jplace = _simple_jplace(
+        "(A:3.0{0},B:10.0{1}):0.0{2};",
+        [("a_seed", 0, 0.1), ("b", 0, 0.8), ("c", 0, 0.8), ("far", 1, 0.0)],
+    )
+    results = []
+    for chunk_size in (1, 1000):
+        p = Phylotypes(pd_threshold=1.0, distance="legacy", random_state=1)
+        p.load_jplace_dict(jplace)
+        p.generate_phylotypes_incremental(seed_size=1, apply_chunk_size=chunk_size)
+        results.append(sorted(sorted(group) for group in p.phylogroups))
+    assert results[0] == results[1] == [["a_seed", "b"], ["c"], ["far"]]
+
+
+def test_reconcile_weights_groups_by_sv_count():
+    """A large preliminary group must not be treated like a singleton."""
+    p = Phylotypes(pd_threshold=1.7, distance="kr")
+    rows = [(f"a{i}", 0, 0.0) for i in range(10)] + [("b", 0, 0.9), ("c", 0, 2.0)]
+    p.load_jplace_dict(_simple_jplace("(A:3.0{0},B:10.0{1}):0.0{2};", rows))
+    groups = [list(range(10)), [10], [11]]
+    reconciled = [{p.placement_names[i] for i in group} for group in p._reconcile_groups(groups, sample_size=100)]
+    assert {frozenset(group) for group in reconciled} == {
+        frozenset({*(f"a{i}" for i in range(10)), "b"}),
+        frozenset({"c"}),
+    }
+
+
 def _make_star_jplace(n_leaves: int = 20, svs_per_leaf: int = 15) -> dict:
     """A star tree (root + n_leaves, each edge length 1.0) with svs_per_leaf
     SVs placed identically (full LWR, zero distal length) on each leaf.
@@ -190,9 +274,7 @@ def _make_overlapping_jplace(
         left_edge = pair * 3
         right_edge = left_edge + 1
         internal_edge = left_edge + 2
-        pairs.append(
-            f"(L{pair}a:0.3[{left_edge}],L{pair}b:0.3[{right_edge}]):2.0[{internal_edge}]"
-        )
+        pairs.append(f"(L{pair}a:0.3[{left_edge}],L{pair}b:0.3[{right_edge}]):2.0[{internal_edge}]")
         for side, edge in (("a", left_edge), ("b", right_edge)):
             placements.extend(
                 {"p": [[edge, -10, 1.0, 0.0, 0.01]], "nm": [[f"pure_{pair}_{side}_{j}", 1]]}
@@ -255,7 +337,11 @@ def _pairs_sharing_a_group(phylogroups):
     ],
 )
 def test_incremental_close_to_batch_on_synthetic_data(
-    jplace, threshold, metric, seed_size, expand_batch_size,
+    jplace,
+    threshold,
+    metric,
+    seed_size,
+    expand_batch_size,
 ):
     """Medium synthetic test: incremental result should agree with batch on
     most SV pairs (>= 90%), though exact equality is not expected since the
@@ -274,7 +360,7 @@ def test_incremental_close_to_batch_on_synthetic_data(
 
     batch_pairs = _pairs_sharing_a_group(p_batch.phylogroups)
     inc_pairs = _pairs_sharing_a_group(p_inc.phylogroups)
-    agreement = len(batch_pairs & inc_pairs) / len(batch_pairs)
+    agreement = len(batch_pairs & inc_pairs) / len(batch_pairs | inc_pairs)
     assert agreement >= 0.9, agreement
 
 
@@ -296,14 +382,17 @@ def test_batched_matches_sequential_apply():
     batched = _load_overlapping(random_state=17)
     batch_pool, batch_index, remaining = _overlapping_apply_state(batched)
     batch_orphans = batched._apply_svs_batched(
-        remaining, batch_pool, batch_index, distal_length=True, chunk_size=1,
+        remaining,
+        batch_pool,
+        batch_index,
+        distal_length=True,
+        chunk_size=1,
     )
 
     streaming = _load_overlapping(random_state=17)
     stream_pool, stream_index, stream_remaining = _overlapping_apply_state(streaming)
     stream_orphans = [
-        sv for sv in stream_remaining
-        if not streaming._apply_sv(sv, stream_pool, stream_index, distal_length=True)
+        sv for sv in stream_remaining if not streaming._apply_sv(sv, stream_pool, stream_index, distal_length=True)
     ]
 
     assert batch_orphans == stream_orphans
@@ -319,7 +408,7 @@ def test_incremental_reproducible_with_seed():
     assert results[0] == results[1]
 
 
-def test_chunk_size_effect_is_bounded():
+def test_apply_chunk_size_does_not_change_grouping():
     results = []
     for chunk_size in (1, 1000):
         p = _load_overlapping(random_state=31)
@@ -328,8 +417,6 @@ def test_chunk_size_effect_is_bounded():
             expand_batch_size=25,
             apply_chunk_size=chunk_size,
         )
-        results.append(_pairs_sharing_a_group(p.phylogroups))
+        results.append(sorted(sorted(group) for group in p.phylogroups))
 
-    smaller, larger = results
-    agreement = len(smaller & larger) / len(smaller)
-    assert agreement >= 0.9, agreement
+    assert results[0] == results[1]

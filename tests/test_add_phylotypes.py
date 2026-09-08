@@ -93,6 +93,15 @@ def test_build_combined_propagates_random_state():
     assert combined_a._rng.sample(population, 10) == combined_b._rng.sample(population, 10)
 
 
+def test_build_combined_rejects_reused_sv_names():
+    """A new placement must not overwrite an existing phylotype member."""
+    tree = _star_tree(2)
+    previous = _jplace(tree, [_on_edge("shared", 0)])
+    new = _jplace(tree, [_on_edge("shared", 1)])
+    with pytest.raises(ValueError, match="reuse SV name"):
+        build_combined(io.StringIO(json.dumps(previous)), io.StringIO(json.dumps(new)))
+
+
 # ---------------------------------------------------------------------------
 # Assignment behavior
 # ---------------------------------------------------------------------------
@@ -177,7 +186,8 @@ def test_cluster_orphans_creates_new_phylotypes():
         [_on_edge("orphan_a", 3), _on_edge("orphan_b", 3)],
     )
     combined, _, new_names = build_combined(
-        io.StringIO(json.dumps(prev)), io.StringIO(json.dumps(new)),
+        io.StringIO(json.dumps(prev)),
+        io.StringIO(json.dumps(new)),
     )
     assigned, orphans = assign_new_svs(combined, sv_pt, new_names, pd_threshold=1.0)
     clustered = cluster_orphans(combined, orphans, pd_threshold=1.0, batch_size=1)
@@ -192,7 +202,8 @@ def test_cluster_orphans_avoids_reserved_ids():
     prev, sv_pt = _make_previous(n_leaves=4, used_leaves=(0, 1, 2))
     new = _jplace(prev["tree"], [_on_edge("orphan", 3)])
     combined, _, new_names = build_combined(
-        io.StringIO(json.dumps(prev)), io.StringIO(json.dumps(new)),
+        io.StringIO(json.dumps(prev)),
+        io.StringIO(json.dumps(new)),
     )
     _, orphans = assign_new_svs(combined, sv_pt, new_names)
 
@@ -286,8 +297,17 @@ def test_main_replaces_stale_orphan_file_when_no_orphans(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
         [
-            "add_phylotypes", "-P", str(prev_jp), "-p", str(prev_csv),
-            "-N", str(new_jp), "-O", str(out_csv), "--orphans", str(orphan_csv),
+            "add_phylotypes",
+            "-P",
+            str(prev_jp),
+            "-p",
+            str(prev_csv),
+            "-N",
+            str(new_jp),
+            "-O",
+            str(out_csv),
+            "--orphans",
+            str(orphan_csv),
         ],
     )
     main()
@@ -316,9 +336,18 @@ def test_add_phylotypes_cluster_orphans_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
         [
-            "add_phylotypes", "-P", str(prev_jp), "-p", str(prev_csv),
-            "-N", str(new_jp), "-O", str(out_csv), "--cluster-orphans",
-            "--pd-threshold", "1.0",
+            "add_phylotypes",
+            "-P",
+            str(prev_jp),
+            "-p",
+            str(prev_csv),
+            "-N",
+            str(new_jp),
+            "-O",
+            str(out_csv),
+            "--cluster-orphans",
+            "--pd-threshold",
+            "1.0",
         ],
     )
     main()
