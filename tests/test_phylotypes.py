@@ -172,24 +172,101 @@ def _make_star_jplace(n_leaves: int = 20, svs_per_leaf: int = 15) -> dict:
     }
 
 
+def _make_overlapping_jplace(
+    n_pairs: int = 8,
+    svs_per_leaf: int = 10,
+    bridging_per_pair: int = 4,
+) -> dict:
+    """Sibling leaf pairs plus SVs whose placements overlap both siblings.
+
+    Each leaf edge is 0.3 long, so pure placements on sibling leaves are 0.6
+    apart. With ``pd_threshold=0.4`` they remain separate phylotypes, while a
+    0.6/0.4 bridging placement is within the threshold of both. Long internal
+    branches keep different sibling pairs well separated.
+    """
+    pairs = []
+    placements = []
+    for pair in range(n_pairs):
+        left_edge = pair * 3
+        right_edge = left_edge + 1
+        internal_edge = left_edge + 2
+        pairs.append(
+            f"(L{pair}a:0.3[{left_edge}],L{pair}b:0.3[{right_edge}]):2.0[{internal_edge}]"
+        )
+        for side, edge in (("a", left_edge), ("b", right_edge)):
+            placements.extend(
+                {"p": [[edge, -10, 1.0, 0.0, 0.01]], "nm": [[f"pure_{pair}_{side}_{j}", 1]]}
+                for j in range(svs_per_leaf)
+            )
+        placements.extend(
+            {
+                "p": [
+                    [left_edge, -10, 0.6, 0.0, 0.01],
+                    [right_edge, -10, 0.4, 0.0, 0.01],
+                ],
+                "nm": [[f"bridge_{pair}_{j}", 1]],
+            }
+            for j in range(bridging_per_pair)
+        )
+
+    return {
+        "version": 3,
+        "tree": f"({','.join(pairs)}):0.0[{n_pairs * 3}];",
+        "fields": ["edge_num", "likelihood", "like_weight_ratio", "distal_length", "pendant_length"],
+        "placements": placements,
+        "metadata": {},
+    }
+
+
+def _load_overlapping(*, random_state: int = 7) -> Phylotypes:
+    p = Phylotypes(pd_threshold=0.4, distance="kr", random_state=random_state)
+    p.load_jplace(io.StringIO(json.dumps(_make_overlapping_jplace())))
+    return p
+
+
+def _overlapping_apply_state(p: Phylotypes):
+    """Build a two-phylotype-per-pair pool and return the remaining SV indices."""
+    pool = []
+    edge_index = {}
+    seeded = set()
+    for pair in range(8):
+        for side in ("a", "b"):
+            idx = p.placement_idx[f"pure_{pair}_{side}_0"]
+            seeded.add(idx)
+            edges = p._sv_edges(idx)
+            pt_i = len(pool)
+            pool.append({"members": [idx], "edges": edges})
+            for edge in edges:
+                edge_index.setdefault(edge, set()).add(pt_i)
+    remaining = [idx for idx in range(len(p.placement_names)) if idx not in seeded]
+    return pool, edge_index, remaining
+
+
 def _pairs_sharing_a_group(phylogroups):
     sv_to_group = {sv: gi for gi, grp in enumerate(phylogroups) for sv in grp}
     return {(a, b) for a, b in itertools.combinations(sorted(sv_to_group), 2) if sv_to_group[a] == sv_to_group[b]}
 
 
-def test_incremental_close_to_batch_on_synthetic_data():
+@pytest.mark.parametrize(
+    "jplace,threshold,metric,seed_size,expand_batch_size",
+    [
+        (_make_star_jplace(n_leaves=20, svs_per_leaf=15), 1.0, "legacy", 10, 25),
+        (_make_overlapping_jplace(), 0.4, "kr", 16, 25),
+    ],
+)
+def test_incremental_close_to_batch_on_synthetic_data(
+    jplace, threshold, metric, seed_size, expand_batch_size,
+):
     """Medium synthetic test: incremental result should agree with batch on
     most SV pairs (>= 90%), though exact equality is not expected since the
     two paths use different linkage strategies."""
-    jplace = _make_star_jplace(n_leaves=20, svs_per_leaf=15)
-
-    p_batch = Phylotypes(lwr_overlap=0.1, pd_threshold=1.0, distance="legacy")
+    p_batch = Phylotypes(lwr_overlap=0.1, pd_threshold=threshold, distance=metric, random_state=7)
     p_batch.load_jplace(io.StringIO(json.dumps(jplace)))
     p_batch.generate_phylotypes()
 
-    p_inc = Phylotypes(lwr_overlap=0.1, pd_threshold=1.0, distance="legacy")
+    p_inc = Phylotypes(lwr_overlap=0.1, pd_threshold=threshold, distance=metric, random_state=7)
     p_inc.load_jplace(io.StringIO(json.dumps(jplace)))
-    p_inc.generate_phylotypes_incremental(seed_size=10, expand_batch_size=25)
+    p_inc.generate_phylotypes_incremental(seed_size=seed_size, expand_batch_size=expand_batch_size)
 
     batch_svs = {sv for grp in p_batch.phylogroups for sv in grp}
     inc_svs = {sv for grp in p_inc.phylogroups for sv in grp}
@@ -198,4 +275,61 @@ def test_incremental_close_to_batch_on_synthetic_data():
     batch_pairs = _pairs_sharing_a_group(p_batch.phylogroups)
     inc_pairs = _pairs_sharing_a_group(p_inc.phylogroups)
     agreement = len(batch_pairs & inc_pairs) / len(batch_pairs)
+    assert agreement >= 0.9, agreement
+
+
+def test_multi_candidate_path_is_exercised():
+    p = _load_overlapping()
+    pool, edge_index, remaining = _overlapping_apply_state(p)
+    candidate_counts = []
+    for sv in remaining:
+        candidates = set()
+        for edge in p._sv_edges(sv):
+            candidates.update(edge_index.get(edge, ()))
+        candidate_counts.append(len(candidates))
+
+    assert any(count > 1 for count in candidate_counts)
+    assert pool  # sanity: candidates came from a populated pool
+
+
+def test_batched_matches_sequential_apply():
+    batched = _load_overlapping(random_state=17)
+    batch_pool, batch_index, remaining = _overlapping_apply_state(batched)
+    batch_orphans = batched._apply_svs_batched(
+        remaining, batch_pool, batch_index, distal_length=True, chunk_size=1,
+    )
+
+    streaming = _load_overlapping(random_state=17)
+    stream_pool, stream_index, stream_remaining = _overlapping_apply_state(streaming)
+    stream_orphans = [
+        sv for sv in stream_remaining
+        if not streaming._apply_sv(sv, stream_pool, stream_index, distal_length=True)
+    ]
+
+    assert batch_orphans == stream_orphans
+    assert [pt["members"] for pt in batch_pool] == [pt["members"] for pt in stream_pool]
+
+
+def test_incremental_reproducible_with_seed():
+    results = []
+    for _ in range(2):
+        p = _load_overlapping(random_state=23)
+        p.generate_phylotypes_incremental(seed_size=16, expand_batch_size=25)
+        results.append(sorted(sorted(group) for group in p.phylogroups))
+    assert results[0] == results[1]
+
+
+def test_chunk_size_effect_is_bounded():
+    results = []
+    for chunk_size in (1, 1000):
+        p = _load_overlapping(random_state=31)
+        p.generate_phylotypes_incremental(
+            seed_size=16,
+            expand_batch_size=25,
+            apply_chunk_size=chunk_size,
+        )
+        results.append(_pairs_sharing_a_group(p.phylogroups))
+
+    smaller, larger = results
+    agreement = len(smaller & larger) / len(smaller)
     assert agreement >= 0.9, agreement

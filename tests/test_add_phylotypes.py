@@ -10,6 +10,7 @@ import pytest
 from phylotypes.add_phylotypes import (
     assign_new_svs,
     build_combined,
+    cluster_orphans,
     main,
     read_phylotype_csv,
 )
@@ -72,6 +73,24 @@ def test_build_combined_loads_standard_edge_numbered_jplace():
     # The combined instance holds both previous and new placements.
     assert "brand_new" in combined.sv_nodes
     assert "sv1" in combined.sv_nodes
+
+
+def test_build_combined_propagates_random_state():
+    prev = json.load(FIXTURE.open())
+    new = _jplace(prev["tree"], [_on_edge("brand_new", 0)])
+    combined_a, _, _ = build_combined(
+        io.StringIO(json.dumps(prev)),
+        io.StringIO(json.dumps(new)),
+        random_state=42,
+    )
+    combined_b, _, _ = build_combined(
+        io.StringIO(json.dumps(prev)),
+        io.StringIO(json.dumps(new)),
+        random_state=42,
+    )
+
+    population = list(range(100))
+    assert combined_a._rng.sample(population, 10) == combined_b._rng.sample(population, 10)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +169,42 @@ def test_assignment_covers_all_new_svs():
     assert orphans == {"n_orphan"}
 
 
+def test_cluster_orphans_creates_new_phylotypes():
+    """Sorting plus reconciliation merges same-edge fragments across batches."""
+    prev, sv_pt = _make_previous(n_leaves=4, used_leaves=(0, 1, 2))
+    new = _jplace(
+        prev["tree"],
+        [_on_edge("orphan_a", 3), _on_edge("orphan_b", 3)],
+    )
+    combined, _, new_names = build_combined(
+        io.StringIO(json.dumps(prev)), io.StringIO(json.dumps(new)),
+    )
+    assigned, orphans = assign_new_svs(combined, sv_pt, new_names, pd_threshold=1.0)
+    clustered = cluster_orphans(combined, orphans, pd_threshold=1.0, batch_size=1)
+
+    assert assigned == {}
+    assert set(clustered) == {"orphan_a", "orphan_b"}
+    assert len(set(clustered.values())) == 1
+    assert next(iter(clustered.values())).startswith("pt_new_")
+
+
+def test_cluster_orphans_avoids_reserved_ids():
+    prev, sv_pt = _make_previous(n_leaves=4, used_leaves=(0, 1, 2))
+    new = _jplace(prev["tree"], [_on_edge("orphan", 3)])
+    combined, _, new_names = build_combined(
+        io.StringIO(json.dumps(prev)), io.StringIO(json.dumps(new)),
+    )
+    _, orphans = assign_new_svs(combined, sv_pt, new_names)
+
+    clustered = cluster_orphans(
+        combined,
+        orphans,
+        reserved_ids={"pt_new_00001", "unrelated_id"},
+    )
+
+    assert clustered == {"orphan": "pt_new_00002"}
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -209,6 +264,70 @@ def test_main_end_to_end(tmp_path, monkeypatch):
     rows = list(csv.DictReader(out_csv.open()))
     assert {r["sv"] for r in rows} == {"e0", "e1"}
     assert {r["phylotype"] for r in rows} <= set(sv_pt.values())
+
+
+def test_main_replaces_stale_orphan_file_when_no_orphans(tmp_path, monkeypatch):
+    prev, sv_pt = _make_previous(n_leaves=4, used_leaves=(0, 1, 2))
+    new = _jplace(prev["tree"], [_on_edge("existing", 0)])
+    prev_jp = tmp_path / "prev.jplace"
+    prev_jp.write_text(json.dumps(prev))
+    new_jp = tmp_path / "new.jplace"
+    new_jp.write_text(json.dumps(new))
+    prev_csv = tmp_path / "prev_pt.csv"
+    with prev_csv.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["phylotype", "sv"])
+        for sv, pt in sv_pt.items():
+            writer.writerow([pt, sv])
+    out_csv = tmp_path / "out.csv"
+    orphan_csv = tmp_path / "orphans.csv"
+    orphan_csv.write_text("sv\nstale_result\n")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "add_phylotypes", "-P", str(prev_jp), "-p", str(prev_csv),
+            "-N", str(new_jp), "-O", str(out_csv), "--orphans", str(orphan_csv),
+        ],
+    )
+    main()
+
+    assert orphan_csv.read_text() == "sv\n"
+
+
+def test_add_phylotypes_cluster_orphans_end_to_end(tmp_path, monkeypatch):
+    prev, sv_pt = _make_previous(n_leaves=4, used_leaves=(0, 1, 2))
+    new = _jplace(
+        prev["tree"],
+        [_on_edge("existing", 0), _on_edge("orphan_a", 3), _on_edge("orphan_b", 3)],
+    )
+    prev_jp = tmp_path / "prev.jplace"
+    prev_jp.write_text(json.dumps(prev))
+    new_jp = tmp_path / "new.jplace"
+    new_jp.write_text(json.dumps(new))
+    prev_csv = tmp_path / "prev_pt.csv"
+    with prev_csv.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["phylotype", "sv"])
+        for sv, pt in sv_pt.items():
+            writer.writerow([pt, sv])
+    out_csv = tmp_path / "out.csv"
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "add_phylotypes", "-P", str(prev_jp), "-p", str(prev_csv),
+            "-N", str(new_jp), "-O", str(out_csv), "--cluster-orphans",
+            "--pd-threshold", "1.0",
+        ],
+    )
+    main()
+
+    rows = list(csv.DictReader(out_csv.open()))
+    by_sv = {row["sv"]: row["phylotype"] for row in rows}
+    assert by_sv["existing"] in set(sv_pt.values())
+    assert by_sv["orphan_a"].startswith("pt_new_")
+    assert by_sv["orphan_a"] == by_sv["orphan_b"]
 
 
 def test_main_mismatched_previous_csv_exits(tmp_path, monkeypatch):
