@@ -70,6 +70,18 @@ def test_legacy_tree_distance_not_dropped():
     assert emd[0, 2] > emd[0, 1] + 0.3, (emd[0, 1].item(), emd[0, 2].item())
 
 
+@pytest.mark.parametrize(
+    ("metric", "distal_length"), [("legacy", True), ("legacy", False), ("kr", True), ("kr", False)]
+)
+def test_cross_distance_matches_pairwise_slice(metric, distal_length):
+    p = _load(metric)
+    left = [0, 1]
+    right = [2, 3]
+    expected = p.pairwise_distance([*left, *right], distal_length=distal_length)[: len(left), len(left) :]
+    actual = p._cross_distance(left, right, distal_length=distal_length)
+    assert torch.allclose(actual, expected)
+
+
 def test_kr_is_a_metric_and_matches_expected():
     """KR (true tree-Wasserstein): validated values + metric axioms."""
     p = _load("kr")
@@ -216,7 +228,10 @@ def test_incremental_apply_chunk_size_does_not_change_grouping():
         p.load_jplace_dict(jplace)
         p.generate_phylotypes_incremental(seed_size=1, apply_chunk_size=chunk_size)
         results.append(sorted(sorted(group) for group in p.phylogroups))
-    assert results[0] == results[1] == [["a_seed", "b"], ["c"], ["far"]]
+    # Primary invariant: chunk_size must not affect grouping.
+    assert results[0] == results[1]
+    # Secondary: sanity-check the actual grouping for this fixture.
+    assert results[0] == [["a_seed", "b"], ["c"], ["far"]]
 
 
 def test_reconcile_weights_groups_by_sv_count():
@@ -360,6 +375,7 @@ def test_incremental_close_to_batch_on_synthetic_data(
 
     batch_pairs = _pairs_sharing_a_group(p_batch.phylogroups)
     inc_pairs = _pairs_sharing_a_group(p_inc.phylogroups)
+    # Jaccard similarity: penalises both missed and spurious co-groupings.
     agreement = len(batch_pairs & inc_pairs) / len(batch_pairs | inc_pairs)
     assert agreement >= 0.9, agreement
 

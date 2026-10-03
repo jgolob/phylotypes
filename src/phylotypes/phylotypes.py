@@ -386,6 +386,13 @@ class Phylotypes:
         )
 
         self.placement_present = self.placement_lwr > 0
+        # Retain each placement's sparse support for incremental candidate
+        # lookup and LCA calculations.  Reconstructing these sets with a
+        # tensor-wide ``nonzero`` call was a substantial part of incremental
+        # legacy-distance runtime.
+        self.placement_edge_sets = [
+            frozenset(self.node_name_to_idx[str(node)] for node in self.sv_nodes[name]) for name in self.placement_names
+        ]
 
     def _build_tree_geometry(self) -> None:
         """
@@ -457,15 +464,15 @@ class Phylotypes:
         self._lca_depth_cache[node_idx] = depth
         return depth
 
-    def _lca_depth_matrix(self, present: torch.Tensor) -> torch.Tensor:
+    def _lca_depth_matrix(self, placement_indices: list[int]) -> torch.Tensor:
         """
         Depth of the LCA of the symmetric-difference node set for each pair of placements.
 
         Parameters
         ----------
-        present : torch.Tensor
-            Boolean tensor of shape (n, n_nodes); `present[i]` is the set of node
-            columns on which placement `i` has any weight.
+        placement_indices : list[int]
+            Placement row indices. Their cached sparse edge supports are used to
+            find each pair's symmetric difference.
 
         Returns
         -------
@@ -475,16 +482,36 @@ class Phylotypes:
             Pairs with identical support get 0 -- their contribution is zeroed out by
             the (1 - overlap) fractions in the caller regardless.
         """
-        n = present.shape[0]
+        n = len(placement_indices)
         out = torch.zeros((n, n), dtype=torch.float32, device=self.device)
         for a in range(n):
             for b in range(a + 1, n):
-                distant = (present[a] ^ present[b]).nonzero(as_tuple=True)[0]
-                if distant.numel() == 0:
+                distant = (
+                    self.placement_edge_sets[placement_indices[a]] ^ self.placement_edge_sets[placement_indices[b]]
+                )
+                if not distant:
                     continue
-                depth = self._lca_depth_for_nodes(tuple(sorted(distant.tolist())))
+                depth = self._lca_depth_for_nodes(tuple(sorted(distant)))
                 out[a, b] = depth
                 out[b, a] = depth
+        return out
+
+    def _lca_depth_cross_matrix(
+        self,
+        left_indices: list[int],
+        right_indices: list[int],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return LCA depths for the cross product of two placement lists."""
+        out = torch.zeros((len(left_indices), len(right_indices)), dtype=dtype, device=device)
+        for left_i, left in enumerate(left_indices):
+            left_support = self.placement_edge_sets[left]
+            for right_i, right in enumerate(right_indices):
+                distant = left_support ^ self.placement_edge_sets[right]
+                if distant:
+                    out[left_i, right_i] = self._lca_depth_for_nodes(tuple(sorted(distant)))
         return out
 
     def pairwise_distance(
@@ -527,6 +554,93 @@ class Phylotypes:
             return self._pairwise_legacy(placement_indices, distal_length=distal_length)
         msg = f"Unknown distance metric: {metric!r}"
         raise ValueError(msg)
+
+    def _cross_distance(
+        self,
+        left_indices: list[int],
+        right_indices: list[int],
+        *,
+        distal_length: bool = True,
+    ) -> torch.Tensor:
+        """Calculate distances between, rather than within, two placement lists.
+
+        Incremental APPLY and RECONCILE only use cross-group distances.  The
+        legacy and KR implementations both avoid calculating the two unused
+        within-list triangles.
+        """
+        if not left_indices or not right_indices:
+            return torch.zeros(
+                (len(left_indices), len(right_indices)),
+                dtype=self.placement_lwr.dtype,
+                device=self.placement_lwr.device,
+            )
+        if self.distance == "legacy":
+            return self._cross_legacy(left_indices, right_indices, distal_length=distal_length)
+        return self._cross_kr(left_indices, right_indices, distal_length=distal_length)
+
+    def _cross_legacy(
+        self,
+        left_indices: list[int],
+        right_indices: list[int],
+        *,
+        distal_length: bool = True,
+    ) -> torch.Tensor:
+        """Calculate the exact legacy metric for a rectangular pair set."""
+        if self.tree is None:
+            msg = "Tree must be loaded"
+            raise ValueError(msg)
+
+        dtype = self.placement_lwr.dtype
+        device = self.placement_lwr.device
+        left_lwr = self.placement_lwr[left_indices].to(dtype)
+        right_lwr = self.placement_lwr[right_indices].to(dtype)
+        left_ind = self.placement_present[left_indices].to(dtype)
+        right_ind = self.placement_present[right_indices].to(dtype)
+        eps = torch.finfo(dtype).eps
+        left_p = left_lwr / left_lwr.sum(dim=1, keepdim=True).clamp_min(eps)
+        right_p = right_lwr / right_lwr.sum(dim=1, keepdim=True).clamp_min(eps)
+        if distal_length:
+            left_dl = self.placement_dl[left_indices].to(dtype)
+            right_dl = self.placement_dl[right_indices].to(dtype)
+        else:
+            left_dl = torch.zeros_like(left_lwr)
+            right_dl = torch.zeros_like(right_lwr)
+        depth = self.node_depth_tensor.to(dtype=dtype, device=device)
+
+        left_s = (left_dl * left_p).sum(dim=1)
+        right_s = (right_dl * right_p).sum(dim=1)
+        left_dep_all = (depth.unsqueeze(0) * left_p).sum(dim=1)
+        right_dep_all = (depth.unsqueeze(0) * right_p).sum(dim=1)
+        left_overlap = left_p @ right_ind.T
+        right_overlap = right_p @ left_ind.T
+        left_dep_overlap = (left_p * depth.unsqueeze(0)) @ right_ind.T
+        right_dep_overlap = (right_p * depth.unsqueeze(0)) @ left_ind.T
+        lca_depth = self._lca_depth_cross_matrix(left_indices, right_indices, dtype=dtype, device=device)
+
+        result = (
+            left_s.unsqueeze(1)
+            + right_s.unsqueeze(0)
+            + (left_dep_all.unsqueeze(1) - left_dep_overlap)
+            + (right_dep_all.unsqueeze(0) - right_dep_overlap.T)
+            - lca_depth * (2.0 - left_overlap - right_overlap.T)
+        )
+        for left_i, left in enumerate(left_indices):
+            for right_i, right in enumerate(right_indices):
+                if left == right:
+                    result[left_i, right_i] = 0.0
+        return result
+
+    def _cross_kr(
+        self,
+        left_indices: list[int],
+        right_indices: list[int],
+        *,
+        distal_length: bool = True,
+    ) -> torch.Tensor:
+        """Calculate exact KR distances for a rectangular pair set."""
+        phi = self._kr_embedding([*left_indices, *right_indices], distal_length=distal_length)
+        left_count = len(left_indices)
+        return (phi[:left_count].unsqueeze(1) - phi[left_count:].unsqueeze(0)).abs().sum(dim=2)
 
     def _pairwise_legacy(
         self,
@@ -597,7 +711,7 @@ class Phylotypes:
 
         frac_a = 1.0 - wov
         frac_b = 1.0 - wov.T
-        lca_depth = self._lca_depth_matrix(self.placement_present[idx]).to(dtype=dtype, device=device)
+        lca_depth = self._lca_depth_matrix(idx).to(dtype=dtype, device=device)
 
         result = (
             s.unsqueeze(1)
@@ -662,7 +776,30 @@ class Phylotypes:
         if n <= 1:
             return torch.zeros((n, n), dtype=dtype, device=device)
 
-        a = self.placement_lwr[idx].to(dtype).clone()
+        phi = self._kr_embedding(idx, distal_length=distal_length)
+        emd = torch.zeros((n, n), dtype=dtype, device=device)
+        for s in range(0, n, batch_size):
+            emd[s : s + batch_size] = (phi[s : s + batch_size].unsqueeze(1) - phi.unsqueeze(0)).abs().sum(dim=2)
+        emd.clamp_min_(0.0)
+        torch.diagonal(emd).fill_(0.0)
+        return emd
+
+    def _kr_embedding(self, placement_indices: list[int], *, distal_length: bool) -> torch.Tensor:
+        """Build the exact KR L1 embedding for the supplied placements."""
+        if not hasattr(self, "placement_lwr"):
+            msg = "Placement tensor must be built first"
+            raise ValueError(msg)
+        if distal_length and not hasattr(self, "placement_dl"):
+            msg = "Placement distal length tensor must be built"
+            raise ValueError(msg)
+        if self.tree is None:
+            msg = "Tree must be loaded"
+            raise ValueError(msg)
+
+        dtype = self.placement_lwr.dtype
+        device = self.placement_lwr.device
+        n = len(placement_indices)
+        a = self.placement_lwr[placement_indices].to(dtype).clone()
         row_sum = a.sum(dim=1, keepdim=True)
         if bool((row_sum.squeeze(1) <= 0).any()):
             logging.warning(
@@ -671,7 +808,7 @@ class Phylotypes:
             )
         a = a / row_sum.clamp_min(torch.finfo(dtype).eps)
 
-        dl = self.placement_dl[idx].to(dtype)
+        dl = self.placement_dl[placement_indices].to(dtype)
         zero_vec = torch.zeros(n, dtype=dtype, device=device)
 
         incl: dict[int, torch.Tensor] = {}
@@ -704,16 +841,10 @@ class Phylotypes:
                 phi_cols.append((below + included) * seg_len)
 
         if not phi_cols:
-            return torch.zeros((n, n), dtype=dtype, device=device)
+            return torch.zeros((n, 0), dtype=dtype, device=device)
         phi = torch.stack(phi_cols, dim=1)
         keep = (phi.amax(dim=0) - phi.amin(dim=0)) > 0
-        phi = phi[:, keep]
-        emd = torch.zeros((n, n), dtype=dtype, device=device)
-        for s in range(0, n, batch_size):
-            emd[s : s + batch_size] = (phi[s : s + batch_size].unsqueeze(1) - phi.unsqueeze(0)).abs().sum(dim=2)
-        emd.clamp_min_(0.0)
-        torch.diagonal(emd).fill_(0.0)
-        return emd
+        return phi[:, keep]
 
     def _get_lca_for_group(self, group: list[int]) -> TreeNode:
         """
@@ -931,11 +1062,14 @@ class Phylotypes:
         """
         if min_lwr > 0.0:
             return set((self.placement_lwr[sv_idx] > min_lwr).nonzero(as_tuple=True)[0].tolist())
-        return set(self.placement_present[sv_idx].nonzero(as_tuple=True)[0].tolist())
+        return set(self.placement_edge_sets[sv_idx])
 
     def _group_edges(self, members: list[int]) -> set[int]:
         """Union of tree-edge (node-column) indices used by any placement in `members`."""
-        return set(self.placement_present[members].any(dim=0).nonzero(as_tuple=True)[0].tolist())
+        edges: set[int] = set()
+        for member in members:
+            edges.update(self.placement_edge_sets[member])
+        return edges
 
     @staticmethod
     def _attach_sv(
@@ -1017,8 +1151,8 @@ class Phylotypes:
             # candidate, matching the multi-candidate path's threshold check.
             members = pool[pt_i]["members"]
             sample = members if len(members) <= sample_size else self._rng.sample(members, sample_size)
-            dist = self.pairwise_distance([sv, *sample], distal_length=distal_length)
-            mean_dist = float(dist[0, 1:].mean())
+            dist = self._cross_distance([sv], sample, distal_length=distal_length)
+            mean_dist = float(dist[0].mean())
             if mean_dist >= self.pd_threshold:
                 return False
         else:
@@ -1026,8 +1160,8 @@ class Phylotypes:
             for cand in candidates:
                 members = pool[cand]["members"]
                 sample = members if len(members) <= sample_size else self._rng.sample(members, sample_size)
-                dist = self.pairwise_distance([sv, *sample], distal_length=distal_length)
-                mean_dist = float(dist[0, 1:].mean())
+                dist = self._cross_distance([sv], sample, distal_length=distal_length)
+                mean_dist = float(dist[0].mean())
                 if best is None or mean_dist < best[0]:
                     best = (mean_dist, cand)
             if best is None or best[0] >= self.pd_threshold:
@@ -1048,7 +1182,7 @@ class Phylotypes:
         distal_length: bool,
         sample_size: int = 10,
         min_lwr: float = 0.0,
-        chunk_size: int = 1000,
+        chunk_size: int = 10_000,
     ) -> list[int]:
         """Assign multiple SVs to existing phylotypes in streaming order.
 
@@ -1070,26 +1204,26 @@ class Phylotypes:
             Same semantics as :meth:`_apply_sv`.
         chunk_size : int, optional
             Compatibility-only outer iteration size; every assignment is applied
-            sequentially regardless of this value (default: 1000).
+            sequentially regardless of this value (default: 10_000).
 
         Returns
         -------
         list[int]
             Placement indices that could not be assigned (orphans).
         """
+        del chunk_size  # accepted for API compatibility, no longer used
         orphans: list[int] = []
 
-        for chunk_start in range(0, len(svs), chunk_size):
-            for sv in svs[chunk_start : chunk_start + chunk_size]:
-                if not self._apply_sv(
-                    sv,
-                    pool,
-                    edge_index,
-                    distal_length=distal_length,
-                    sample_size=sample_size,
-                    min_lwr=min_lwr,
-                ):
-                    orphans.append(sv)
+        for sv in svs:
+            if not self._apply_sv(
+                sv,
+                pool,
+                edge_index,
+                distal_length=distal_length,
+                sample_size=sample_size,
+                min_lwr=min_lwr,
+            ):
+                orphans.append(sv)
 
         return orphans
 
@@ -1151,18 +1285,14 @@ class Phylotypes:
         samples = [g if len(g) <= sample_size else self._rng.sample(g, sample_size) for g in groups]
 
         k = len(groups)
-        reconcile_mat = np.zeros((k, k), dtype=np.float64)
+        distances: dict[tuple[int, int], float] = {}
+        queue: list[tuple[float, int, int]] = []
         for i in range(k):
             for j in range(i + 1, k):
                 si, sj = samples[i], samples[j]
-                dist = self.pairwise_distance(
-                    [*si, *sj],
-                    distal_length=distal_length,
-                )
-                ni = len(si)
-                d = float(dist[:ni, ni:].mean())
-                reconcile_mat[i, j] = d
-                reconcile_mat[j, i] = d
+                distance = float(self._cross_distance(si, sj, distal_length=distal_length).mean())
+                distances[(i, j)] = distance
+                queue.append((distance, i, j))
 
         # Perform UPGMA directly so subsequent merge distances are weighted by
         # the SV counts represented by the two groups.  sklearn's precomputed
@@ -1171,14 +1301,14 @@ class Phylotypes:
         active = set(range(k))
         members = {i: list(group) for i, group in enumerate(groups)}
         weights = {i: len(group) for i, group in enumerate(groups)}
-        # Stale entries are filtered by the ``active`` set check; no explicit cleanup needed.
-        distances = {(i, j): float(reconcile_mat[i, j]) for i in range(k) for j in range(i + 1, k)}
-        queue = [(distance, i, j) for (i, j), distance in distances.items()]
         heapq.heapify(queue)
         next_id = k
 
         while queue:
             distance, left, right = heapq.heappop(queue)
+            # Stale heap entries (referencing already-merged clusters) are
+            # skipped here; the ``distances`` dict is pruned via ``.pop()``
+            # inside the merge loop, so only the heap grows monotonically.
             if left not in active or right not in active:
                 continue
             if distance >= self.pd_threshold:
@@ -1190,17 +1320,25 @@ class Phylotypes:
             weights[merged_id] = weights[left] + weights[right]
             active.remove(left)
             active.remove(right)
+            distances.pop((left, right) if left < right else (right, left), None)
 
             for other in active:
                 left_key = (left, other) if left < other else (other, left)
                 right_key = (right, other) if right < other else (other, right)
-                w_left = weights[left] * distances[left_key]
-                w_right = weights[right] * distances[right_key]
+                w_left = weights[left] * distances.pop(left_key)
+                w_right = weights[right] * distances.pop(right_key)
                 updated = (w_left + w_right) / weights[merged_id]
                 key = (merged_id, other) if merged_id < other else (other, merged_id)
                 distances[key] = updated
                 heapq.heappush(queue, (updated, *key))
             active.add(merged_id)
+
+            # The heap retains stale entries after a UPGMA merge.  Compact it
+            # when they outnumber live distances, keeping peak memory bounded
+            # by a small multiple of the active O(K^2) state.
+            if len(queue) > 2 * len(distances):
+                queue = [(distance, *key) for key, distance in distances.items()]
+                heapq.heapify(queue)
 
         return [members[group_id] for group_id in sorted(active)]
 
@@ -1212,7 +1350,7 @@ class Phylotypes:
         expand_batch_size: int = 200,
         min_lwr: float = 0.0,
         sample_size: int = 10,
-        apply_chunk_size: int = 1000,
+        apply_chunk_size: int = 10_000,
     ) -> None:
         """
         Group features into phylotypes incrementally (seed -> apply -> expand -> reconcile).
@@ -1234,9 +1372,9 @@ class Phylotypes:
         phylotype boundaries, some placements may therefore be grouped differently
         than they would be by the batch path. This is an accepted, explicit
         trade-off in exchange for avoiding a full SV-by-SV distance matrix in
-        the SEED and EXPAND stages. RECONCILE still requires a dense matrix of
-        the current phylotype pool, so its memory use is quadratic in the
-        number of provisional phylotypes.
+        the SEED and EXPAND stages. RECONCILE retains only active sampled
+        inter-phylotype distances, but its time and memory use are still
+        quadratic in the number of provisional phylotypes.
 
         Every APPLY decision observes the members and edge index created by all
         earlier accepted SVs. ``apply_chunk_size`` is retained for command-line
@@ -1266,7 +1404,7 @@ class Phylotypes:
         apply_chunk_size : int, optional
             Compatibility-only outer iteration size for Stage C and Stage D
             re-application passes. Assignments are always applied sequentially,
-            so this value does not change grouping (default: 1000).
+            so this value does not change grouping (default: 10_000).
 
         Raises
         ------
@@ -1353,14 +1491,23 @@ class Phylotypes:
         )
         # Sort orphans by their primary (highest-LWR) edge's postorder position
         # in the tree so that phylogenetically close orphans land in the same
-        # batch, reducing batch-boundary artifacts.  Re-sorted after each batch
-        # so that orphans surviving re-application stay well-ordered.
+        # batch, reducing batch-boundary artifacts.  Re-applying preserves the
+        # input order of surviving orphans, so this is needed only once.
         _sorter = self.primary_edge_sorter()
         if orphans and _sorter is not None:
             orphans.sort(key=_sorter)
 
+        expand_round = 0
         while orphans:
+            expand_round += 1
             batch, orphans = orphans[:expand_batch_size], orphans[expand_batch_size:]
+            logging.info(
+                "EXPAND round %d: clustering batch of %d orphans (%d still queued, %d phylotypes so far)",
+                expand_round,
+                len(batch),
+                len(orphans),
+                len(pool),
+            )
             if len(batch) == 1:
                 new_groups = [batch]
             else:
@@ -1376,6 +1523,11 @@ class Phylotypes:
                     batch_groups[cl].append(batch[local_i])
                 new_groups = list(batch_groups.values())
 
+            logging.info(
+                "EXPAND round %d: batch produced %d new phylotypes",
+                expand_round,
+                len(new_groups),
+            )
             for members in new_groups:
                 pt_i = len(pool)
                 edges = self._group_edges(members)
@@ -1383,6 +1535,7 @@ class Phylotypes:
                 for edge in edges:
                     edge_index[edge].add(pt_i)
 
+            pre_reapply = len(orphans)
             orphans = self._apply_svs_batched(
                 orphans,
                 pool,
@@ -1392,8 +1545,15 @@ class Phylotypes:
                 min_lwr=min_lwr,
                 chunk_size=apply_chunk_size,
             )
-            if orphans and _sorter is not None:
-                orphans.sort(key=_sorter)
+            absorbed = pre_reapply - len(orphans)
+            if pre_reapply > 0:
+                logging.info(
+                    "EXPAND round %d: re-apply absorbed %d/%d queued orphans, %d remain",
+                    expand_round,
+                    absorbed,
+                    pre_reapply,
+                    len(orphans),
+                )
 
         # ---- Stage E: RECONCILE ----
         logging.info(
@@ -1593,8 +1753,8 @@ def main() -> None:
         "--apply-chunk-size",
         help="Compatibility-only outer iteration size for --incremental APPLY passes. "
         "Assignments are always applied sequentially, so it does not change grouping. "
-        "(Default: 1000).",
-        default=1000,
+        "(Default: 10000).",
+        default=10_000,
         type=int,
     )
 

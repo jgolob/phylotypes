@@ -29,6 +29,29 @@ This is particularly useful when attempting a metanalysis of 16s rRNA gene varia
 
 `--apply-chunk-size <int>` Retained for compatibility. Incremental assignments are applied sequentially, so this setting does not change grouping. Default: `1000`.
 
+#### Incremental performance and stability
+
+Incremental mode computes distances only between a placement and the members it
+is being compared with, and keeps reconciliation state compact.  It therefore
+uses less memory than a full feature-by-feature matrix, but reconciliation still
+scales quadratically with the number of provisional phylotypes.
+
+There is no universally optimal `--seed-size` or `--expand-batch-size`: the
+number of distinct phylotypes, placement ambiguity, and orphan rate matter more
+than the total feature count.  Start with the defaults (`200` and `200`) and
+benchmark representative data.  Increasing either size can reduce follow-up
+assignment work, but increases the quadratic distance calculation for that
+stage.
+
+These are grouping parameters as well as performance parameters.  Changing
+them changes the initial clusters and the order in which sampled assignments
+are made.  Clearly separated groups tend to be stable; placements near the
+distance threshold or overlapping several groups can differ.  For analyses
+where this matters, compare a `100`/`200`/`500` grid across several random
+seeds, recording pairwise group agreement, group counts, and small-group
+membership.  Record the seed size, expansion batch size, random seed, distance
+metric, threshold, and sample size with each result.
+
 `--device <str>` PyTorch device for tensor computations, e.g. `cpu` or `cuda`. Default: `cpu`.
 
 `--max-pregroup-size <int>` Maximum SVs in a single pregroup after LCA-based re-clustering; larger pregroups are split back to their pre-merge groups to bound memory use. Default: `5000`.
