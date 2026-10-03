@@ -436,3 +436,139 @@ def test_apply_chunk_size_does_not_change_grouping():
         results.append(sorted(sorted(group) for group in p.phylogroups))
 
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("metric", ["legacy", "kr"])
+def test_small_branches_preserve_distance(metric):
+    p = Phylotypes(distance=metric)
+    p.load_jplace_dict(_simple_jplace("(A:0.000001[0],B:0.000001[1]):0.0[2];", [("a", 0, 0), ("b", 1, 0)]))
+    assert p.name_node["0"].length == pytest.approx(1e-6, rel=1e-12)
+    assert float(p.pairwise_distance()[0, 1]) == pytest.approx(2e-6)
+
+
+@pytest.mark.parametrize("metric", ["legacy", "kr"])
+@pytest.mark.parametrize("extra_weight", [0.0, 1e-50])
+def test_zero_weight_edges_do_not_change_support_or_distance(metric, extra_weight):
+    data = _simple_jplace("((A:1.0{0},B:1.0{1}):1.0{2},C:1.0{3}):0.0{4};", [("a", 0, 0), ("b", 1, 0)])
+    p = Phylotypes(distance=metric)
+    p.load_jplace_dict(data)
+    expected = p.pairwise_distance()
+    data["placements"][0]["p"].append([3, extra_weight, 0])
+    p.load_jplace_dict(data)
+    for i, support in enumerate(p.placement_edge_sets):
+        assert support == frozenset(p.placement_present[i].nonzero().flatten().tolist())
+    assert torch.allclose(p.pairwise_distance(), expected)
+    assert torch.allclose(p._cross_distance([0], [1]), expected[:1, 1:])
+    pool = [{"members": [1], "edges": {p.node_name_to_idx["3"]}}]
+    assert not p._apply_sv(0, pool, {p.node_name_to_idx["3"]: {0}}, distal_length=False)
+
+
+@pytest.mark.parametrize("weights", [[-1.0], [-1e-50], [float("nan")], [float("inf")], [0.0], [1e-50], [3e38, 3e38]])
+def test_invalid_placement_weights_rejected(weights):
+    data = _simple_jplace("(A:1.0{0},B:1.0{1}):0.0{2};", [("a", 0, 0)])
+    data["placements"][0]["p"] = [[edge, weight, 0] for edge, weight in enumerate(weights)]
+    with pytest.raises(ValueError, match="finite, nonnegative weights and positive totals"):
+        Phylotypes().load_jplace_dict(data)
+
+
+@pytest.mark.parametrize("metric", ["legacy", "kr"])
+def test_tiny_positive_weights_normalize_to_unit_mass(metric):
+    data = _simple_jplace("(A:1.0{0},B:1.0{1}):0.0{2};", [("a", 0, 0), ("b", 1, 0)])
+    p = Phylotypes(distance=metric)
+    p.load_jplace_dict(data)
+    expected = p.pairwise_distance()
+    for placement in data["placements"]:
+        placement["p"][0][1] = 1e-30
+    p.load_jplace_dict(data)
+    assert torch.allclose(p.pairwise_distance(), expected)
+    assert torch.allclose(p._cross_distance([0], [1]), expected[:1, 1:])
+
+
+@pytest.mark.parametrize("metric", ["legacy", "kr"])
+@pytest.mark.parametrize("incremental_calls", [(False, False), (True, True), (False, True), (True, False)])
+def test_generation_replaces_results_and_reload_clears_groups(metric, incremental_calls):
+    p = _load(metric)
+    methods = {False: p.generate_phylotypes, True: p.generate_phylotypes_incremental}
+    methods[incremental_calls[0]]()
+    expected = sorted(sorted(group) for group in p.phylogroups)
+    methods[incremental_calls[1]]()
+    assert sorted(sorted(group) for group in p.phylogroups) == expected
+    assert sorted(sv for _, sv in p.to_long()) == p.placement_names
+    p.load_jplace_dict(_simple_jplace("(A:1.0{0}):0.0{1};", [("new", 0, 0)]))
+    assert p.phylogroups == p._pregrouped_sv == p._pregroup_lca == []
+    for incremental in incremental_calls:
+        methods[incremental]()
+        assert p.phylogroups == [{"new"}]
+        assert p.to_long() == [("pt__00001", "new")]
+    p.load_jplace_dict(_simple_jplace("(A:1.0{0}):0.0{1};", []))
+    for incremental in incremental_calls:
+        methods[incremental]()
+        assert p.phylogroups == p._pregrouped_sv == p._pregroup_lca == []
+
+
+def test_initial_pregroup_limit_fails_before_pairwise_allocation(monkeypatch):
+    p = Phylotypes(max_pregroup_size=2)
+    p.load_jplace_dict(_simple_jplace("(A:1.0{0}):0.0{1};", [(str(i), 0, 0) for i in range(4)]))
+    p.phylogroups = [{"previous"}]
+
+    def unexpected_distance(*_args, **_kwargs):
+        pytest.fail("Pairwise allocation must not occur for an oversized initial group")
+
+    monkeypatch.setattr(p, "pairwise_distance", unexpected_distance)
+    with pytest.raises(ValueError, match=r"Initial LWR pregroup has 4 SVs.*incremental clustering"):
+        p.generate_phylotypes()
+    assert p.phylogroups == [{"previous"}]
+
+
+def test_positive_pregroup_limit_retains_small_constituents():
+    p = _load()
+    p.max_pregroup_size = 2
+    p._pregroup_by_lwr()
+    assert all(len(group) <= 2 for group in p._pregrouped_sv)
+    assert sorted(i for group in p._pregrouped_sv for i in group) == list(range(4))
+
+
+def test_cross_kr_chunks_both_axes():
+    p = _load("kr")
+    left = [0, 1, 2] * 23
+    right = [2, 3] * 35
+    expected = p.pairwise_distance()[left][:, right]
+    assert torch.allclose(p._cross_distance(left, right), expected)
+
+
+def test_import_preserves_application_logging():
+    import subprocess
+    import sys
+
+    script = """
+import logging
+root = logging.getLogger()
+handler = logging.StreamHandler()
+root.addHandler(handler)
+root.setLevel(logging.ERROR)
+handlers = list(root.handlers)
+import phylotypes.phylotypes
+assert root.level == logging.ERROR
+assert root.handlers == handlers
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def test_cli_reports_initial_pregroup_limit(tmp_path, monkeypatch, caplog):
+    import sys
+
+    from phylotypes.phylotypes import main
+
+    jplace_path = tmp_path / "input.jplace"
+    out_path = tmp_path / "output.csv"
+    data = _simple_jplace("(A:1.0{0}):0.0{1};", [(str(i), 0, 0) for i in range(4)])
+    jplace_path.write_text(json.dumps(data))
+    monkeypatch.setattr(
+        sys, "argv", ["phylotypes", "--jplace", str(jplace_path), "--out", str(out_path), "--max-pregroup-size", "2"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    assert "Initial LWR pregroup has 4 SVs" in caplog.text
+    assert "use incremental clustering or raise the limit" in caplog.text
+    assert not out_path.exists()

@@ -19,6 +19,7 @@ from io import StringIO
 import itertools
 import json
 import logging
+import math
 from pathlib import Path
 import random
 import re
@@ -35,13 +36,7 @@ from skbio import TreeNode
 from sklearn.cluster import AgglomerativeClustering
 import torch
 
-# Configure logging
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-log_formatter = logging.Formatter("%(asctime)s %(levelname)-8s [phylotypes] %(message)s")
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-root_logger.addHandler(console_handler)
+logger = logging.getLogger(__name__)
 
 
 class Phylotypes:
@@ -81,9 +76,9 @@ class Phylotypes:
         Index of distal_length field in placement data
     sv_nodes : Dict[str, Dict[int, List[float]]]
         Dictionary mapping feature names to placement nodes
-    name_node : Dict[int, TreeNode]
+    name_node : Dict[str, TreeNode]
         Dictionary mapping node IDs to TreeNode objects
-    node_name : Dict[TreeNode, int]
+    node_name : Dict[TreeNode, str]
         Dictionary mapping TreeNode objects to node IDs
     node_names : List[str]
         List of node names in consistent order for tensor alignment
@@ -118,11 +113,11 @@ class Phylotypes:
         device : str, optional
             torch device to use for tensor computations, e.g. "cpu" or "cuda" (default: "cpu")
         max_pregroup_size : int, optional
-            Maximum number of SVs allowed in a single pregroup after LCA-based
-            re-clustering. Pregroups that would exceed this are split back into
-            their pre-merge constituent groups, to bound the O(n^2) memory used
-            by the pairwise distance matrix and clustering for that group
-            (default: 5000)
+            Maximum SVs in a batch pregroup (default: 5000). Oversized initial
+            LWR groups raise ValueError; oversized LCA merges retain their
+            constituent groups. Bounds per-group pairwise matrices, but not
+            placement tensors or the inter-pregroup LCA matrix. Nonpositive
+            values disable LCA merges and the initial-group size check.
         random_state : int or None, optional
             Seed for the random number generator used by sampling-based
             distance estimation. Set for reproducible results. ``None``
@@ -139,7 +134,7 @@ class Phylotypes:
         self.device: torch.device = torch.device(device)
         self.max_pregroup_size: int = max_pregroup_size
         # Clustering samples require reproducibility, not cryptographic randomness.
-        self._rng: random.Random = random.Random(random_state) if random_state is not None else random.Random()  # noqa: S311
+        self._rng: random.Random = random.Random(random_state)  # noqa: S311
 
         # Data containers
         self.phylogroups: list[set[str]] = []
@@ -188,7 +183,7 @@ class Phylotypes:
             If the JPLACE file cannot be parsed, is missing required fields,
             or contains a tree that cannot be parsed.
         """
-        logging.info("Loading jplace file")
+        logger.info("Loading jplace file")
 
         try:
             jplace = json.load(jplace_fh)
@@ -225,7 +220,7 @@ class Phylotypes:
                 msg = f"Missing required '{field}' entry in jplace."
                 raise ValueError(msg)
 
-        logging.info("Indexing fields")
+        logger.info("Indexing fields")
         try:
             self.edge_idx = self.jplace["fields"].index("edge_num")
             self.lwr_idx = self.jplace["fields"].index("like_weight_ratio")
@@ -234,9 +229,12 @@ class Phylotypes:
             msg = f"Missing required field: {e}. Required: edge_num, like_weight_ratio, distal_length"
             raise ValueError(msg) from e
 
-        logging.info("Loading tree")
+        logger.info("Loading tree")
         self._load_tree()
         self._load_placements()
+        self.phylogroups = []
+        self._pregrouped_sv = []
+        self._pregroup_lca = []
 
     def _load_tree(self) -> None:
         """
@@ -267,7 +265,7 @@ class Phylotypes:
 
             # Convert to scikit-bio TreeNode format
             with StringIO() as th:
-                Phylo.write(tp, th, "newick")
+                Phylo.write(tp, th, "newick", format_branch_length="%.17g")
                 th.seek(0)
                 self.tree = TreeNode.read(th)
         except Exception as e:
@@ -294,7 +292,7 @@ class Phylotypes:
         sv_nodes : Dict[str, Dict[int, List[float]]]
             Dictionary mapping feature names to placement nodes
         """
-        logging.info(
+        logger.info(
             "Indexing %d placements into SV-node map",
             len(self.jplace["placements"]),
         )
@@ -317,19 +315,19 @@ class Phylotypes:
         # And list / vector based lookups of node *names*
         self.node_names = sorted({str(node_name) for pl in self.sv_nodes.values() for node_name in pl})
         self.node_name_to_idx = {name: idx for idx, name in enumerate(self.node_names)}
-        logging.info(
+        logger.info(
             "Indexed %d unique SVs across %d unique nodes",
             len(self.sv_nodes),
             len(self.node_names),
         )
 
-        logging.info(
+        logger.info(
             "Building placement tensors (%d x %d)",
             len(self.sv_nodes),
             len(self.node_names),
         )
         self._build_placement_tensors()
-        logging.info("Building tree geometry")
+        logger.info("Building tree geometry")
         self._build_tree_geometry()
 
     def _build_placement_tensors(self) -> None:
@@ -370,6 +368,10 @@ class Phylotypes:
                 lwr_vals.append(data[self.lwr_idx])
                 dl_vals.append(data[self.dl_idx])
 
+        if any(not math.isfinite(weight) or weight < 0 for weight in lwr_vals):
+            msg = "Placements require finite, nonnegative weights and positive totals"
+            raise ValueError(msg)
+
         row_idx = torch.tensor(rows, dtype=torch.long)
         col_idx = torch.tensor(cols, dtype=torch.long)
 
@@ -385,14 +387,28 @@ class Phylotypes:
             torch.tensor(dl_vals, dtype=torch.float32, device=self.device),
         )
 
+        row_sums = self.placement_lwr.sum(dim=1)
+        invalid = (
+            ~torch.isfinite(self.placement_lwr).all(dim=1)
+            | (self.placement_lwr < 0).any(dim=1)
+            | ~torch.isfinite(row_sums)
+            | (row_sums <= 0)
+        )
+        if bool(invalid.any()):
+            msg = "Placements require finite, nonnegative weights and positive totals"
+            raise ValueError(msg)
+
         self.placement_present = self.placement_lwr > 0
         # Retain each placement's sparse support for incremental candidate
         # lookup and LCA calculations.  Reconstructing these sets with a
         # tensor-wide ``nonzero`` call was a substantial part of incremental
         # legacy-distance runtime.
-        self.placement_edge_sets = [
-            frozenset(self.node_name_to_idx[str(node)] for node in self.sv_nodes[name]) for name in self.placement_names
-        ]
+        positive = (torch.tensor(lwr_vals, dtype=torch.float32) > 0).tolist()
+        supports: list[set[int]] = [set() for _ in self.placement_names]
+        for row, col, has_weight in zip(rows, cols, positive, strict=True):
+            if has_weight:
+                supports[row].add(col)
+        self.placement_edge_sets = [frozenset(support) for support in supports]
 
     def _build_tree_geometry(self) -> None:
         """
@@ -596,9 +612,8 @@ class Phylotypes:
         right_lwr = self.placement_lwr[right_indices].to(dtype)
         left_ind = self.placement_present[left_indices].to(dtype)
         right_ind = self.placement_present[right_indices].to(dtype)
-        eps = torch.finfo(dtype).eps
-        left_p = left_lwr / left_lwr.sum(dim=1, keepdim=True).clamp_min(eps)
-        right_p = right_lwr / right_lwr.sum(dim=1, keepdim=True).clamp_min(eps)
+        left_p = left_lwr / left_lwr.sum(dim=1, keepdim=True)
+        right_p = right_lwr / right_lwr.sum(dim=1, keepdim=True)
         if distal_length:
             left_dl = self.placement_dl[left_indices].to(dtype)
             right_dl = self.placement_dl[right_indices].to(dtype)
@@ -640,7 +655,17 @@ class Phylotypes:
         """Calculate exact KR distances for a rectangular pair set."""
         phi = self._kr_embedding([*left_indices, *right_indices], distal_length=distal_length)
         left_count = len(left_indices)
-        return (phi[:left_count].unsqueeze(1) - phi[left_count:].unsqueeze(0)).abs().sum(dim=2)
+        right_count = len(right_indices)
+        result = phi.new_zeros((left_count, right_count))
+        batch_size = 64
+        for left in range(0, left_count, batch_size):
+            left_phi = phi[left : min(left + batch_size, left_count)]
+            for right in range(0, right_count, batch_size):
+                right_phi = phi[left_count + right : left_count + min(right + batch_size, right_count)]
+                result[left : left + batch_size, right : right + batch_size] = (
+                    (left_phi.unsqueeze(1) - right_phi.unsqueeze(0)).abs().sum(dim=2)
+                )
+        return result
 
     def _pairwise_legacy(
         self,
@@ -699,7 +724,7 @@ class Phylotypes:
 
         lwr = self.placement_lwr[idx].to(dtype)
         ind = self.placement_present[idx].to(dtype)
-        row_sum = lwr.sum(dim=1, keepdim=True).clamp_min(torch.finfo(dtype).eps)
+        row_sum = lwr.sum(dim=1, keepdim=True)
         p = lwr / row_sum
         dl = self.placement_dl[idx].to(dtype) if distal_length else torch.zeros_like(lwr)
         depth = self.node_depth_tensor.to(dtype=dtype, device=device)
@@ -801,12 +826,7 @@ class Phylotypes:
         n = len(placement_indices)
         a = self.placement_lwr[placement_indices].to(dtype).clone()
         row_sum = a.sum(dim=1, keepdim=True)
-        if bool((row_sum.squeeze(1) <= 0).any()):
-            logging.warning(
-                "%d placement(s) have zero total LWR; KR is undefined for them.",
-                int((row_sum.squeeze(1) <= 0).sum()),
-            )
-        a = a / row_sum.clamp_min(torch.finfo(dtype).eps)
+        a = a / row_sum
 
         dl = self.placement_dl[placement_indices].to(dtype)
         zero_vec = torch.zeros(n, dtype=dtype, device=device)
@@ -883,6 +903,11 @@ class Phylotypes:
         -----
         Uses pd_threshold and lwr_overlap instance attributes for clustering parameters.
         """
+        if not self.placement_names:
+            self._pregrouped_sv = []
+            self._pregroup_lca = []
+            return
+
         # Our holder for groups
         groups = []
         # Sort features by number of placements (ascending)
@@ -895,7 +920,7 @@ class Phylotypes:
             )
         ]
 
-        logging.info("Grouping %d SV", len(sv_to_group))
+        logger.info("Grouping %d SV", len(sv_to_group))
         while len(sv_to_group) > 0:
             seed_sv = sv_to_group.pop()
             seed_sv_idx = self.placement_idx[seed_sv]
@@ -917,18 +942,27 @@ class Phylotypes:
             # And get rid of sv
             groups.append(list(group_svs_idx))
 
-        logging.info(
+        largest = max(map(len, groups))
+        if self.max_pregroup_size > 0 and largest > self.max_pregroup_size:
+            msg = (
+                f"Initial LWR pregroup has {largest} SVs, exceeding "
+                f"max_pregroup_size={self.max_pregroup_size}; "
+                "use incremental clustering or raise the limit."
+            )
+            raise ValueError(msg)
+
+        logger.info(
             "Done pre-grouping SV into %d groups, of which the largest is %d items",
             len(groups),
             max(len(svg) for svg in groups),
         )
 
         # Get the LCA for each group
-        logging.info("Obtaining lowest common ancestor for each group")
+        logger.info("Obtaining lowest common ancestor for each group")
         group_lca = [self._get_lca_for_group(grp) for grp in groups]
 
         # Calculate pairwise phylogenetic distances between groups
-        logging.info("Calculating pairwise phylogenetic distance between groups")
+        logger.info("Calculating pairwise phylogenetic distance between groups")
         g_lca_mat = np.zeros(shape=(len(group_lca), len(group_lca)), dtype=np.float64)
         for i in range(len(group_lca)):
             for j in range(i + 1, len(group_lca)):
@@ -949,7 +983,7 @@ class Phylotypes:
             g_lca_clusters = np.zeros(1, dtype=int)
         else:
             # Cluster groups by phylogenetic distance
-            logging.info("Clustering groups by phylogenetic distance")
+            logger.info("Clustering groups by phylogenetic distance")
             g_lca_clusters = AgglomerativeClustering(
                 n_clusters=None,
                 distance_threshold=self.pd_threshold,
@@ -958,7 +992,7 @@ class Phylotypes:
             ).fit_predict(g_lca_mat)
 
         # Regroup SVs based on group clusters
-        logging.info("Regrouping SV based on group-clusters")
+        logger.info("Regrouping SV based on group-clusters")
         new_old_sv_groups = defaultdict(set)
         for old_cluster_idx, new_cluster_idx in enumerate(g_lca_clusters):
             new_old_sv_groups[new_cluster_idx].add(old_cluster_idx)
@@ -967,7 +1001,7 @@ class Phylotypes:
         for olds in new_old_sv_groups.values():
             merged = list({sv for idx in olds for sv in groups[idx]})
             if len(merged) > self.max_pregroup_size:
-                logging.warning(
+                logger.warning(
                     "Pregroup of %d exceeds max_pregroup_size=%d; keeping it unmerged.",
                     len(merged),
                     self.max_pregroup_size,
@@ -976,7 +1010,7 @@ class Phylotypes:
             else:
                 new_sv_groups.append(merged)
 
-        logging.debug(
+        logger.debug(
             "Now %d groups, with the largest %d items",
             len(new_sv_groups),
             max(len(svg) for svg in new_sv_groups),
@@ -1001,32 +1035,28 @@ class Phylotypes:
         distal_length : bool, optional
             Whether to include distal length in calculations (default: True)
 
-        Returns
-        -------
-        List[Set[str]]
-            List of phylotype groups, each as a set of feature names
-
         Notes
         -----
-        This method updates the instance's phylogroups attribute and
-        returns the complete list of phylotypes.
+        Replaces the instance's phylogroups with the generated partition after
+        successful clustering. Returns None.
         """
         if distal_length:
-            logging.info("Using Distal Length")
+            logger.info("Using Distal Length")
         else:
-            logging.info("Ignoring distal length")
+            logger.info("Ignoring distal length")
 
-        logging.info("Pregrouping based on overlapping LWR for SV")
+        logger.info("Pregrouping based on overlapping LWR for SV")
         self._pregroup_by_lwr()
 
-        logging.info("Starting phylogrouping")
+        logger.info("Starting phylogrouping")
 
+        phylogroups: list[set[str]] = []
         for g_i, g_sv in enumerate(self._pregrouped_sv):
             if (g_i + 1) % 100 == 0:
-                logging.debug("Group %d of %d", g_i, len(self._pregrouped_sv))
+                logger.debug("Group %d of %d", g_i, len(self._pregrouped_sv))
 
             if len(g_sv) == 1:
-                self.phylogroups.append({self.placement_names[g_sv[0]]})
+                phylogroups.append({self.placement_names[g_sv[0]]})
                 continue
             # Implict else, this isn't a singleton group.
             # Calculate pairwise phylogenetic distances within group
@@ -1045,9 +1075,10 @@ class Phylotypes:
                 g_phylotype_svs[cl].add(sv)
 
             # Add clusters to phylogroups
-            self.phylogroups.extend(
+            phylogroups.extend(
                 [{self.placement_names[sv_i] for sv_i in phylotype_svs} for phylotype_svs in g_phylotype_svs.values()]
             )
+        self.phylogroups = phylogroups
 
     def _sv_edges(self, sv_idx: int, *, min_lwr: float = 0.0) -> set[int]:
         """Tree-edge (node-column) indices on which placement ``sv_idx`` has weight.
@@ -1192,9 +1223,8 @@ class Phylotypes:
         membership at the start of the batch can admit placements whose mean
         distance from the grown group exceeds ``pd_threshold``.
 
-        ``chunk_size`` remains an API compatibility parameter.  It controls
-        only the outer iteration, not assignment visibility; every assignment
-        is immediately visible to the next one.
+        ``chunk_size`` is ignored and retained for API compatibility. Every
+        assignment is immediately visible to the next one.
 
         Parameters
         ----------
@@ -1203,8 +1233,7 @@ class Phylotypes:
         pool, edge_index, distal_length, sample_size, min_lwr
             Same semantics as :meth:`_apply_sv`.
         chunk_size : int, optional
-            Compatibility-only outer iteration size; every assignment is applied
-            sequentially regardless of this value (default: 10_000).
+            Ignored compatibility parameter (default: 10_000).
 
         Returns
         -------
@@ -1402,9 +1431,8 @@ class Phylotypes:
             Number of members to sample per candidate phylotype when comparing
             distances during APPLY, EXPAND, and RECONCILE stages (default: 10).
         apply_chunk_size : int, optional
-            Compatibility-only outer iteration size for Stage C and Stage D
-            re-application passes. Assignments are always applied sequentially,
-            so this value does not change grouping (default: 10_000).
+            Ignored compatibility parameter (default: 10_000). Assignments
+            are always applied sequentially.
 
         Raises
         ------
@@ -1436,7 +1464,7 @@ class Phylotypes:
         remaining = order[seed_size:]
 
         # ---- Stage A: SEED ----
-        logging.info(
+        logger.info(
             "Incremental Stage A (SEED): clustering %d seed placements",
             len(seed_idx),
         )
@@ -1458,7 +1486,7 @@ class Phylotypes:
                 pool.append({"members": members, "edges": self._group_edges(members)})
 
         # ---- Stage B: edge -> phylotype inverted index ----
-        logging.info(
+        logger.info(
             "Incremental Stage B (INDEX): indexing %d seed phylotypes",
             len(pool),
         )
@@ -1468,7 +1496,7 @@ class Phylotypes:
                 edge_index[edge].add(pt_i)
 
         # ---- Stage C: APPLY ----
-        logging.info(
+        logger.info(
             "Incremental Stage C (APPLY): assigning %d remaining placements (chunk_size=%d)",
             len(remaining),
             apply_chunk_size,
@@ -1484,7 +1512,7 @@ class Phylotypes:
         )
 
         # ---- Stage D: EXPAND ----
-        logging.info(
+        logger.info(
             "Incremental Stage D (EXPAND): %d orphans to cluster in batches of %d",
             len(orphans),
             expand_batch_size,
@@ -1501,7 +1529,7 @@ class Phylotypes:
         while orphans:
             expand_round += 1
             batch, orphans = orphans[:expand_batch_size], orphans[expand_batch_size:]
-            logging.info(
+            logger.info(
                 "EXPAND round %d: clustering batch of %d orphans (%d still queued, %d phylotypes so far)",
                 expand_round,
                 len(batch),
@@ -1523,7 +1551,7 @@ class Phylotypes:
                     batch_groups[cl].append(batch[local_i])
                 new_groups = list(batch_groups.values())
 
-            logging.info(
+            logger.info(
                 "EXPAND round %d: batch produced %d new phylotypes",
                 expand_round,
                 len(new_groups),
@@ -1547,7 +1575,7 @@ class Phylotypes:
             )
             absorbed = pre_reapply - len(orphans)
             if pre_reapply > 0:
-                logging.info(
+                logger.info(
                     "EXPAND round %d: re-apply absorbed %d/%d queued orphans, %d remain",
                     expand_round,
                     absorbed,
@@ -1556,7 +1584,7 @@ class Phylotypes:
                 )
 
         # ---- Stage E: RECONCILE ----
-        logging.info(
+        logger.info(
             "Incremental Stage E (RECONCILE): merging %d phylotypes by sampled inter-phylotype distance",
             len(pool),
         )
@@ -1566,7 +1594,7 @@ class Phylotypes:
             sample_size=sample_size,
         )
 
-        self.phylogroups.extend({self.placement_names[sv_i] for sv_i in members} for members in final_groups)
+        self.phylogroups = [{self.placement_names[sv_i] for sv_i in members} for members in final_groups]
 
     def to_long(self) -> list[tuple[str, str]]:
         """
@@ -1625,6 +1653,10 @@ def main() -> None:
     Parse command-line arguments, load JPLACE data, perform phylotype
     clustering, and write results to a CSV file.
     """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s [phylotypes] %(message)s",
+    )
     args_parser = argparse.ArgumentParser(
         description="""Given a JPLACE file of placed features on a phylogenetic tree,
         generate phylotypes or phylogenetically grouped features."""
@@ -1690,8 +1722,10 @@ def main() -> None:
 
     args_parser.add_argument(
         "--max-pregroup-size",
-        help="Maximum SVs in a single pregroup after LCA-based re-clustering; larger "
-        "pregroups are split back into their pre-merge groups to bound memory use. "
+        help="Maximum SVs per batch pregroup; oversized initial LWR groups raise an error, "
+        "and oversized LCA merges retain their constituent groups. Does not bound "
+        "placement tensors or the inter-pregroup LCA matrix. Nonpositive values disable "
+        "LCA merges and the initial-group size check. "
         "(Default: 5000).",
         default=5000,
         type=int,
@@ -1751,8 +1785,8 @@ def main() -> None:
 
     args_parser.add_argument(
         "--apply-chunk-size",
-        help="Compatibility-only outer iteration size for --incremental APPLY passes. "
-        "Assignments are always applied sequentially, so it does not change grouping. "
+        help="Ignored compatibility parameter for --incremental APPLY passes. "
+        "Assignments are always applied sequentially. "
         "(Default: 10000).",
         default=10_000,
         type=int,
@@ -1771,22 +1805,22 @@ def main() -> None:
     try:
         with args.jplace.open() as jplace_fh:
             phylotypes.load_jplace(jplace_fh)
+        if args.incremental:
+            phylotypes.generate_phylotypes_incremental(
+                distal_length=not args.no_distal_length,
+                seed_size=args.seed_size,
+                expand_batch_size=args.expand_batch_size,
+                min_lwr=args.min_lwr,
+                sample_size=args.sample_size,
+                apply_chunk_size=args.apply_chunk_size,
+            )
+        else:
+            phylotypes.generate_phylotypes(distal_length=not args.no_distal_length)
     except ValueError as e:
-        logging.error(e)
+        logger.error(e)
         sys.exit(1)
-    if args.incremental:
-        phylotypes.generate_phylotypes_incremental(
-            distal_length=not args.no_distal_length,
-            seed_size=args.seed_size,
-            expand_batch_size=args.expand_batch_size,
-            min_lwr=args.min_lwr,
-            sample_size=args.sample_size,
-            apply_chunk_size=args.apply_chunk_size,
-        )
-    else:
-        phylotypes.generate_phylotypes(distal_length=not args.no_distal_length)
 
-    logging.info("Done Phylogrouping. Outputting.")
+    logger.info("Done Phylogrouping. Outputting.")
     with args.out.open("w") as out_fh:
         phylotypes.to_csv(out_fh)
-    logging.info("DONE!")
+    logger.info("DONE!")

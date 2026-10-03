@@ -54,7 +54,7 @@ metric, threshold, and sample size with each result.
 
 `--device <str>` PyTorch device for tensor computations, e.g. `cpu` or `cuda`. Default: `cpu`.
 
-`--max-pregroup-size <int>` Maximum SVs in a single pregroup after LCA-based re-clustering; larger pregroups are split back to their pre-merge groups to bound memory use. Default: `5000`.
+`--max-pregroup-size <int>` Maximum SVs per batch pregroup. Oversized initial LWR groups raise an error: use incremental clustering or raise the limit. Oversized LCA merges retain their constituent groups. This bounds per-group pairwise matrices, but not placement tensors or the inter-pregroup LCA matrix. Nonpositive values disable LCA merges and the initial-group size check. Default: `5000`.
 
 ---
 
